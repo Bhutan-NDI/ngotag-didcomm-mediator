@@ -48,7 +48,7 @@ export class RedisStreamMessagePublishing {
         agent.context.config.logger.info(`*** Session saved for connectionId: ${connectionId} ***`)
 
         try {
-          this.registerConnection(connectionId)
+          await this.registerConnection(connectionId)
         } catch (handlerError) {
           agent.context.config.logger.error(`Error handling LiveSessionSaved: ${handlerError}`)
         }

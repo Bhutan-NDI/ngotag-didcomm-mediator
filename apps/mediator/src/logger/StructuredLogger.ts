@@ -32,6 +32,9 @@ export type HopName =
   | 'mediator.push.send.start'
   | 'mediator.push.send.end'
   | 'mediator.gauge.snapshot'
+  | 'mediator.record.duplicate'
+  | 'mediator.process.unhandled_rejection'
+  | 'mediator.process.uncaught_exception'
 
 export type FlowType = 'connection' | 'issuance' | 'verification' | 'pickup' | 'mediation-coord' | 'lifecycle'
 

@@ -1,4 +1,4 @@
-import { EventEmitter, InjectionSymbols, inject, injectable, type Logger, LogLevel } from '@credo-ts/core'
+import { EventEmitter, InjectionSymbols, RecordDuplicateError, inject, injectable, type Logger, LogLevel } from '@credo-ts/core'
 import {
   DidCommConnectionService,
   type DidCommForwardMessage,
@@ -48,6 +48,23 @@ export class InstrumentedMediatorService extends DidCommMediatorService {
     connectionService: DidCommConnectionService
   ) {
     super(mediationRepository, mediatorRoutingRepository, eventEmitter, logger, connectionService)
+  }
+
+  public override async processMediationRequest(
+    ...args: Parameters<DidCommMediatorService['processMediationRequest']>
+  ): Promise<void> {
+    try {
+      await super.processMediationRequest(...args)
+    } catch (error) {
+      emitStructured(LogLevel.error, {
+        hop: 'mediator.record.duplicate',
+        flow: 'mediation-coord',
+        notes: error instanceof RecordDuplicateError
+          ? `RecordDuplicateError in processMediationRequest: ${error.message}`
+          : error instanceof Error ? error.message : String(error),
+      })
+      throw error
+    }
   }
 
   public override async processForwardMessage(
