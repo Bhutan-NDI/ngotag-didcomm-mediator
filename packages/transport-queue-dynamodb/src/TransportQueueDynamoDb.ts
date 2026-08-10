@@ -1,6 +1,7 @@
 import { AgentContext, EventEmitter } from '@credo-ts/core'
 import {
   AddMessageOptions,
+  DidCommMessagePickupModuleConfig,
   DidCommQueueTransportRepository,
   GetAvailableMessageCountOptions,
   QueuedDidCommMessage,
@@ -21,10 +22,12 @@ export class DidCommTransportQueueDynamoDb implements DidCommQueueTransportRepos
   }
 
   public async getAvailableMessageCount(
-    _agentContext: AgentContext,
-    { connectionId }: GetAvailableMessageCountOptions
+    agentContext: AgentContext,
+    { connectionId, recipientDid }: GetAvailableMessageCountOptions
   ): Promise<number> {
-    return await this.client.getMessageCount(connectionId)
+    const { maximumBatchSize } = agentContext.dependencyManager.resolve(DidCommMessagePickupModuleConfig)
+
+    return await this.client.getMessageCount(connectionId, recipientDid, maximumBatchSize)
   }
 
   public async takeFromQueue(

@@ -71,12 +71,39 @@ export class DynamoDbClientRepository {
     } catch (error) {
       // Already exists
       if (error instanceof Error && error.name === 'ResourceInUseException') {
+        await dcr.validateTableKeySchema()
         return dcr
       }
       throw error
     }
 
     return dcr
+  }
+
+  private async validateTableKeySchema(): Promise<void> {
+    const response = await this.dynamodbClient.send(
+      new DescribeTableCommand({
+        TableName: this.tableName,
+      })
+    )
+
+    const actualKeySchema = response.Table?.KeySchema
+    const hasExpectedKeySchema =
+      actualKeySchema?.length === keySchema.length &&
+      keySchema.every((expectedKey) =>
+        actualKeySchema.some(
+          (actualKey) =>
+            actualKey.AttributeName === expectedKey.AttributeName && actualKey.KeyType === expectedKey.KeyType
+        )
+      )
+
+    if (!hasExpectedKeySchema) {
+      throw new Error(
+        `DynamoDB table ${this.tableName} has an incompatible key schema. Expected ${JSON.stringify(
+          keySchema
+        )}, received ${JSON.stringify(actualKeySchema)}`
+      )
+    }
   }
 
   private async waitForTableToExist(): Promise<void> {
@@ -112,7 +139,7 @@ export class DynamoDbClientRepository {
     })
   }
 
-  async getMessageCount(connectionId: string): Promise<number> {
+  async getMessageCount(connectionId: string, recipientDid?: string, maximumCount?: number): Promise<number> {
     const params: QueryCommandInput = {
       TableName: this.tableName,
       KeyConditionExpression: 'connectionId = :connectionId',
@@ -120,6 +147,17 @@ export class DynamoDbClientRepository {
         ':connectionId': { S: connectionId },
       },
       Select: 'COUNT',
+      Limit: maximumCount,
+      // New messages have larger messageIds, so they remain before the pagination cursor.
+      ScanIndexForward: false,
+    }
+
+    if (recipientDid !== undefined) {
+      params.FilterExpression = 'contains(recipientDids, :recipientDid)'
+      params.ExpressionAttributeValues = {
+        ...params.ExpressionAttributeValues,
+        ':recipientDid': { S: recipientDid },
+      }
     }
 
     try {
@@ -127,6 +165,7 @@ export class DynamoDbClientRepository {
       let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey']
 
       do {
+        const previousLastEvaluatedKey = lastEvaluatedKey
         const command = new QueryCommand({
           ...params,
           ExclusiveStartKey: lastEvaluatedKey,
@@ -135,6 +174,21 @@ export class DynamoDbClientRepository {
 
         count += response.Count || 0
         lastEvaluatedKey = response.LastEvaluatedKey
+
+        if (maximumCount !== undefined && count >= maximumCount) {
+          return maximumCount
+        }
+
+        if (
+          lastEvaluatedKey &&
+          previousLastEvaluatedKey &&
+          JSON.stringify(lastEvaluatedKey) === JSON.stringify(previousLastEvaluatedKey)
+        ) {
+          this.logger.warn(
+            `Stopped counting messages for connection ${connectionId} because DynamoDB returned a non-advancing pagination key`
+          )
+          break
+        }
       } while (lastEvaluatedKey)
 
       return count
