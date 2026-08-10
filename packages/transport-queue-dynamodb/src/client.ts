@@ -124,7 +124,7 @@ export class DynamoDbClientRepository {
 
     try {
       let count = 0
-      let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey'] | undefined
+      let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey']
 
       do {
         const command = new QueryCommand({

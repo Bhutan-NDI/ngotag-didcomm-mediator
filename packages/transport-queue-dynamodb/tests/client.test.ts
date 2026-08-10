@@ -24,14 +24,15 @@ suite('dynamodb client count query pagination', () => {
       .mockResolvedValueOnce({ Count: 2, LastEvaluatedKey: lastEvaluatedKey })
       .mockResolvedValueOnce({ Count: 3 })
 
-    const paginatedClient = Object.create(DynamoDbClientRepository.prototype) as DynamoDbClientRepository & {
+    const paginatedClient = Object.create(DynamoDbClientRepository.prototype) as DynamoDbClientRepository
+    const mutableClient = paginatedClient as unknown as {
       dynamodbClient: { send: typeof send }
       tableName: string
       logger: ConsoleLogger
     }
-    paginatedClient.dynamodbClient = { send }
-    paginatedClient.tableName = 'queued_messages'
-    paginatedClient.logger = new ConsoleLogger(LogLevel.off)
+    mutableClient.dynamodbClient = { send }
+    mutableClient.tableName = 'queued_messages'
+    mutableClient.logger = new ConsoleLogger(LogLevel.off)
 
     const count = await paginatedClient.getMessageCount(connectionId)
 
