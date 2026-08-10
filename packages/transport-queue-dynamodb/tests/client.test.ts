@@ -1,6 +1,7 @@
+import { QueryCommand } from '@aws-sdk/client-dynamodb'
 import { ConsoleLogger, LogLevel } from '@credo-ts/core'
 import { DidCommEncryptedMessage } from '@credo-ts/didcomm'
-import { beforeAll, expect, suite, test } from 'vitest'
+import { beforeAll, expect, suite, test, vi } from 'vitest'
 import { DynamoDbClientRepository } from '../src/client.js'
 
 const connectionId = '4ffdd113-117b-4827-9af5-28aa73ec4bad'
@@ -11,6 +12,49 @@ const encryptedMessage: DidCommEncryptedMessage = {
   protected: 'protected',
   tag: 'tag',
 }
+
+suite('dynamodb client count query pagination', () => {
+  test('get count queries all pages for a connection', async () => {
+    const lastEvaluatedKey = {
+      connectionId: { S: connectionId },
+      messageId: { N: '2' },
+    }
+    const send = vi
+      .fn()
+      .mockResolvedValueOnce({ Count: 2, LastEvaluatedKey: lastEvaluatedKey })
+      .mockResolvedValueOnce({ Count: 3 })
+
+    const paginatedClient = Object.create(DynamoDbClientRepository.prototype) as DynamoDbClientRepository & {
+      dynamodbClient: { send: typeof send }
+      tableName: string
+      logger: ConsoleLogger
+    }
+    paginatedClient.dynamodbClient = { send }
+    paginatedClient.tableName = 'queued_messages'
+    paginatedClient.logger = new ConsoleLogger(LogLevel.off)
+
+    const count = await paginatedClient.getMessageCount(connectionId)
+
+    expect(count).toStrictEqual(5)
+    expect(send).toHaveBeenCalledTimes(2)
+
+    const firstCommand = send.mock.calls[0][0] as QueryCommand
+    expect(firstCommand).toBeInstanceOf(QueryCommand)
+    expect(firstCommand.input).toMatchObject({
+      TableName: 'queued_messages',
+      KeyConditionExpression: 'connectionId = :connectionId',
+      ExpressionAttributeValues: {
+        ':connectionId': { S: connectionId },
+      },
+      Select: 'COUNT',
+    })
+    expect(firstCommand.input).not.toHaveProperty('FilterExpression')
+    expect(firstCommand.input.ExclusiveStartKey).toBeUndefined()
+
+    const secondCommand = send.mock.calls[1][0] as QueryCommand
+    expect(secondCommand.input.ExclusiveStartKey).toStrictEqual(lastEvaluatedKey)
+  })
+})
 
 suite('dynamodb client', () => {
   let client: DynamoDbClientRepository

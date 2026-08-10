@@ -10,8 +10,6 @@ import {
   DynamoDBClientConfigType,
   QueryCommand,
   QueryCommandInput,
-  ScanCommand,
-  ScanCommandInput,
   UpdateItemCommand,
 } from '@aws-sdk/client-dynamodb'
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb'
@@ -115,9 +113,9 @@ export class DynamoDbClientRepository {
   }
 
   async getMessageCount(connectionId: string): Promise<number> {
-    const params: ScanCommandInput = {
+    const params: QueryCommandInput = {
       TableName: this.tableName,
-      FilterExpression: 'connectionId = :connectionId',
+      KeyConditionExpression: 'connectionId = :connectionId',
       ExpressionAttributeValues: {
         ':connectionId': { S: connectionId },
       },
@@ -125,9 +123,21 @@ export class DynamoDbClientRepository {
     }
 
     try {
-      const command = new ScanCommand(params)
-      const response = await this.dynamodbClient.send(command)
-      return response.Count || 0
+      let count = 0
+      let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey'] | undefined
+
+      do {
+        const command = new QueryCommand({
+          ...params,
+          ExclusiveStartKey: lastEvaluatedKey,
+        })
+        const response = await this.dynamodbClient.send(command)
+
+        count += response.Count || 0
+        lastEvaluatedKey = response.LastEvaluatedKey
+      } while (lastEvaluatedKey)
+
+      return count
     } catch (error) {
       this.logger.error('Error getting entries count:', { error })
       throw error
