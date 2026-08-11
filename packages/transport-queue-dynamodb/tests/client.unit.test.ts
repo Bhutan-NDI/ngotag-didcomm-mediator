@@ -1,5 +1,5 @@
 import { CreateTableCommand, DescribeTableCommand, DynamoDBClient, QueryCommand } from '@aws-sdk/client-dynamodb'
-import { AgentContext, ConsoleLogger, LogLevel } from '@credo-ts/core'
+import { AgentContext, ConsoleLogger, DependencyManager, LogLevel } from '@credo-ts/core'
 import { expect, suite, test, vi } from 'vitest'
 import { DynamoDbClientRepository } from '../src/client.js'
 import { DidCommTransportQueueDynamoDb } from '../src/TransportQueueDynamoDb.js'
@@ -24,6 +24,10 @@ suite('dynamodb client count query', () => {
 
       return {
         Table: {
+          AttributeDefinitions: [
+            { AttributeName: 'connectionId', AttributeType: 'S' },
+            { AttributeName: 'messageId', AttributeType: 'N' },
+          ],
           KeySchema: [
             { AttributeName: 'connectionId', KeyType: 'HASH' },
             { AttributeName: 'messageId', KeyType: 'RANGE' },
@@ -47,13 +51,20 @@ suite('dynamodb client count query', () => {
 
       return {
         Table: {
-          KeySchema: [{ AttributeName: 'messageId', KeyType: 'HASH' }],
+          AttributeDefinitions: [
+            { AttributeName: 'connectionId', AttributeType: 'S' },
+            { AttributeName: 'messageId', AttributeType: 'S' },
+          ],
+          KeySchema: [
+            { AttributeName: 'connectionId', KeyType: 'HASH' },
+            { AttributeName: 'messageId', KeyType: 'RANGE' },
+          ],
         },
       } as never
     })
 
     try {
-      await expect(DynamoDbClientRepository.initialize(clientOptions)).rejects.toThrow('incompatible key schema')
+      await expect(DynamoDbClientRepository.initialize(clientOptions)).rejects.toThrow('incompatible schema')
     } finally {
       send.mockRestore()
     }
@@ -64,18 +75,21 @@ suite('dynamodb client count query', () => {
       connectionId: { S: connectionId },
       messageId: { N: '2' },
     }
-    const queryResponses = [
+    const countResponses = [
       { Count: 2, LastEvaluatedKey: lastEvaluatedKey },
       { Count: 3 },
       { Count: 2, LastEvaluatedKey: lastEvaluatedKey },
       { Count: 3 },
     ]
-    let queryCount = 0
+    let countQueryCount = 0
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
       if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof QueryCommand && command.input.Select === 'SPECIFIC_ATTRIBUTES') {
+        return { Items: [{ messageId: { N: '3' } }] } as never
+      }
 
-      return queryResponses[queryCount++] as never
+      return countResponses[countQueryCount++] as never
     })
 
     try {
@@ -93,7 +107,6 @@ suite('dynamodb client count query', () => {
         ExpressionAttributeValues: {
           ':connectionId': { S: connectionId },
         },
-        ScanIndexForward: false,
         Select: 'COUNT',
       })
       expect(firstCommand.input).not.toHaveProperty('FilterExpression')
@@ -105,34 +118,72 @@ suite('dynamodb client count query', () => {
       const cappedCommand = queryCommands[2][0] as QueryCommand
       expect(cappedCommand.input.Limit).toStrictEqual(2)
 
-      const recipientCommand = queryCommands[3][0] as QueryCommand
+      const latestMessageCommand = queryCommands[3][0] as QueryCommand
+      expect(latestMessageCommand.input).toMatchObject({
+        Limit: 1,
+        ProjectionExpression: 'messageId',
+        ScanIndexForward: false,
+        Select: 'SPECIFIC_ATTRIBUTES',
+      })
+
+      const recipientCommand = queryCommands[4][0] as QueryCommand
       expect(recipientCommand.input).toMatchObject({
+        KeyConditionExpression: 'connectionId = :connectionId AND messageId <= :latestMessageId',
         FilterExpression: 'contains(recipientDids, :recipientDid)',
         ExpressionAttributeValues: {
           ':recipientDid': { S: recipientDid },
         },
-        Limit: 10,
       })
+      expect(recipientCommand.input.Limit).toBeUndefined()
     } finally {
       send.mockRestore()
     }
   })
 
-  test('uses Credo maximumBatchSize as the pickup count ceiling', async () => {
+  test('throws for a non-advancing pagination key', async () => {
+    const lastEvaluatedKey = {
+      connectionId: { S: connectionId },
+      messageId: { N: '2' },
+    }
+    let countQueryCount = 0
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+
+      countQueryCount += 1
+      return {
+        Count: 1,
+        LastEvaluatedKey: lastEvaluatedKey,
+      } as never
+    })
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+
+      await expect(client.getMessageCount(connectionId)).rejects.toThrow('non-advancing pagination key')
+      expect(countQueryCount).toStrictEqual(2)
+    } finally {
+      send.mockRestore()
+    }
+  })
+
+  test('uses the configured pickup count ceiling without requiring a DI registration', async () => {
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
       if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
 
       return { Count: 2, LastEvaluatedKey: { connectionId: { S: connectionId } } } as never
     })
-    const agentContext = {
-      dependencyManager: {
-        resolve: () => ({ maximumBatchSize: 2 }),
-      },
-    } as unknown as AgentContext
 
     try {
-      const repository = await DidCommTransportQueueDynamoDb.initialize(clientOptions)
+      const repository = await DidCommTransportQueueDynamoDb.initialize({
+        ...clientOptions,
+        maximumMessageCount: 2,
+      })
+      const agentContext = new AgentContext({
+        contextCorrelationId: 'test',
+        dependencyManager: new DependencyManager(),
+      })
 
       expect(await repository.getAvailableMessageCount(agentContext, { connectionId })).toStrictEqual(2)
 

@@ -162,6 +162,46 @@ suite('dynamodb client', () => {
     await client.removeMessages({ connectionId: newConnectionId, messageIds: ids })
   })
 
+  test('counts and takes the same recipient messages', async () => {
+    const newConnectionId = 'recipient-filter-connection-id'
+    const otherRecipientDid = 'did:key:other'
+    const targetRecipientDid = 'did:key:target'
+    const otherMessageIds = await Promise.all(
+      Array.from({ length: 20 }, (_, index) =>
+        client.addMessage({
+          connectionId: newConnectionId,
+          recipientDids: [otherRecipientDid],
+          encryptedMessage,
+          receivedAt: new Date(index),
+        })
+      )
+    )
+    const targetMessageIds = await Promise.all(
+      Array.from({ length: 5 }, (_, index) =>
+        client.addMessage({
+          connectionId: newConnectionId,
+          recipientDids: [targetRecipientDid],
+          encryptedMessage,
+          receivedAt: new Date(1000 + index),
+        })
+      )
+    )
+
+    expect(await client.getMessageCount(newConnectionId, targetRecipientDid, 10)).toStrictEqual(5)
+
+    const messages = await client.getMessages({
+      connectionId: newConnectionId,
+      recipientDid: targetRecipientDid,
+      limit: 5,
+    })
+    expect(messages.map((message) => message.id)).toStrictEqual(targetMessageIds)
+
+    await client.removeMessages({
+      connectionId: newConnectionId,
+      messageIds: [...otherMessageIds, ...targetMessageIds],
+    })
+  })
+
   test('validate sorting', async () => {
     const now = new Date()
     const oneHourInThePast = new Date()

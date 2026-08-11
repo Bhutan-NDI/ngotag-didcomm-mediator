@@ -1,7 +1,6 @@
 import { AgentContext, EventEmitter } from '@credo-ts/core'
 import {
   AddMessageOptions,
-  DidCommMessagePickupModuleConfig,
   DidCommQueueTransportRepository,
   GetAvailableMessageCountOptions,
   QueuedDidCommMessage,
@@ -10,24 +9,39 @@ import {
 } from '@credo-ts/didcomm'
 import { DynamoDbClientRepository, DynamoDbClientRepositoryOptions } from './client.js'
 
+export type DynamoDbTransportQueueOptions = DynamoDbClientRepositoryOptions & {
+  /**
+   * @default 10
+   */
+  maximumMessageCount?: number
+}
+
 export class DidCommTransportQueueDynamoDb implements DidCommQueueTransportRepository {
   private client: DynamoDbClientRepository
+  private maximumMessageCount: number
 
-  private constructor(client: DynamoDbClientRepository) {
+  private constructor(client: DynamoDbClientRepository, maximumMessageCount: number) {
     this.client = client
+    this.maximumMessageCount = maximumMessageCount
   }
 
-  public static async initialize(options: DynamoDbClientRepositoryOptions) {
-    return new DidCommTransportQueueDynamoDb(await DynamoDbClientRepository.initialize(options))
+  public static async initialize(options: DynamoDbTransportQueueOptions) {
+    const { maximumMessageCount = 10, ...clientOptions } = options
+    if (!Number.isInteger(maximumMessageCount) || maximumMessageCount < 1) {
+      throw new Error('maximumMessageCount must be a positive integer')
+    }
+
+    return new DidCommTransportQueueDynamoDb(
+      await DynamoDbClientRepository.initialize(clientOptions),
+      maximumMessageCount
+    )
   }
 
   public async getAvailableMessageCount(
-    agentContext: AgentContext,
+    _agentContext: AgentContext,
     { connectionId, recipientDid }: GetAvailableMessageCountOptions
   ): Promise<number> {
-    const { maximumBatchSize } = agentContext.dependencyManager.resolve(DidCommMessagePickupModuleConfig)
-
-    return await this.client.getMessageCount(connectionId, recipientDid, maximumBatchSize)
+    return await this.client.getMessageCount(connectionId, recipientDid, this.maximumMessageCount)
   }
 
   public async takeFromQueue(
