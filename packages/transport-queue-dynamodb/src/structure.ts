@@ -28,3 +28,29 @@ export const keySchema: Array<KeySchemaElement> = [
     KeyType: KeyType.RANGE,
   },
 ]
+
+// A DynamoDB GSI cannot index every value in `recipientDids`, because it is a
+// list. Keep the queue table unchanged and use a companion table instead. One
+// small index item is written for every recipient and points back to the
+// canonical queue item. This keeps the encrypted payload stored once.
+export const recipientIndexAttributeDefinitions: Array<AttributeDefinition> = [
+  {
+    AttributeName: 'connectionId',
+    AttributeType: ScalarAttributeType.S,
+  },
+  {
+    AttributeName: 'recipientMessageId',
+    AttributeType: ScalarAttributeType.S,
+  },
+]
+
+export const recipientIndexKeySchema: Array<KeySchemaElement> = [
+  {
+    AttributeName: 'connectionId',
+    KeyType: KeyType.HASH,
+  },
+  {
+    AttributeName: 'recipientMessageId',
+    KeyType: KeyType.RANGE,
+  },
+]

@@ -238,7 +238,9 @@ When running the Askar to Drizzle storage delettion after successul migration fr
 - `forwardingStrategy`: `DirectDelivery`, `QueueOnly`, `QueueAndLiveModeDelivery`. The `DirectDelivery` strategy will deliver messages directly to the recipient, while the `QueueOnly` strategy will only queue the messages for the recipient. The `QueueAndLiveModeDelivery` strategy will queue the messages for the recipient and deliver them directly if possible. The default is `DirectDelivery`.
 - `storage.type`: `credo`, `postgres`, or `dynamodb`
   - For `postgres`: `host`, `user`, `password`, `database`
-  - For `dynamodb`: `region`, `accessKeyId`, `secretAccessKey`, `tableName`
+  - For `dynamodb`: `region`, `accessKeyId`, `secretAccessKey`, `tableName`, `recipientIndexTableName` (optional)
+    - The mediator creates a companion recipient index table named `<tableName>_recipient_index` by default. It lets recipient-DID pickup use a DynamoDB key condition rather than reading and filtering every queued message for the connection.
+    - Set `recipientIndexTableName` when the companion table must use a different name. The DynamoDB principal needs the same create, describe, read, and write permissions for this table as for `tableName`.
 - `multiInstanceDelivery.type`: `none` or `redis`.
   - `none`. In this case multi instance delivery is not enabled. Use this if you're using `postgres` for `messagePickup.storage.type`, or if only deploying a single instance.
   - For `redis`: You MUST also use `redis` for `cache.type` in this case. The redis URL will be extracted from the cache configuration. The `redis` multi instance delivery uses Redis streams, ensuring consistent delivery and handling of underliverd messages.
@@ -270,6 +272,7 @@ MESSAGE_PICKUP__STORAGE__TYPE=dynamodb \
 MESSAGE_PICKUP__STORAGE__REGION=local \
 MESSAGE_PICKUP__STORAGE__ACCESS_KEY_ID=local \
 MESSAGE_PICKUP__STORAGE__TABLE_NAME=queued_messages \
+MESSAGE_PICKUP__STORAGE__RECIPIENT_INDEX_TABLE_NAME=queued_messages_recipient_index \
 MESSAGE_PICKUP__STORAGE__SECRET_ACCESS_KEY=local \
 pnpm dev
 ```

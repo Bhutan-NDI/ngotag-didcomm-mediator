@@ -1,13 +1,15 @@
-import { randomInt } from 'node:crypto'
+import { createHash, randomInt } from 'node:crypto'
 import {
+  BatchGetItemCommand,
+  BatchWriteItemCommand,
   CreateTableCommand,
   CreateTableCommandInput,
-  DeleteItemCommand,
-  DeleteItemCommandInput,
   DescribeTableCommand,
   DescribeTableCommandInput,
   DynamoDBClient,
   DynamoDBClientConfigType,
+  GetItemCommand,
+  PutItemCommand,
   QueryCommand,
   QueryCommandInput,
   UpdateItemCommand,
@@ -15,7 +17,13 @@ import {
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb'
 import { Logger } from '@credo-ts/core'
 import { DidCommEncryptedMessage } from '@credo-ts/didcomm'
-import { attributeDefinitions, keySchema, QueuedMessage } from './structure.js'
+import {
+  attributeDefinitions,
+  keySchema,
+  QueuedMessage,
+  recipientIndexAttributeDefinitions,
+  recipientIndexKeySchema,
+} from './structure.js'
 
 export type AddQueuedMessageOptions = {
   connectionId: string
@@ -30,74 +38,83 @@ export type RemoveQueuedMessageOptions = {
 }
 
 export type DynamoDbClientRepositoryOptions = DynamoDBClientConfigType & {
-  /**
-   * @default queued_messages
-   */
+  /** @default queued_messages */
   tableName?: string
-
+  /** @default <tableName>_recipient_index */
+  recipientIndexTableName?: string
   logger: Logger
 }
+
+type RecipientIndexMetadata = { cutoverMessageId: number }
+type RecipientIndexEntry = { messageId: string }
+
+const RECIPIENT_INDEX_METADATA_KEY = '__recipient_index_metadata__'
+const RECIPIENT_INDEX_PREFIX = 'r#'
 
 export class DynamoDbClientRepository {
   private dynamodbClient: DynamoDBClient
   private tableName: string
+  private recipientIndexTableName: string
   private logger: Logger
 
   private constructor(options: DynamoDbClientRepositoryOptions) {
     this.dynamodbClient = new DynamoDBClient(options)
     this.tableName = options.tableName ?? 'queued_messages'
+    this.recipientIndexTableName = options.recipientIndexTableName ?? `${this.tableName}_recipient_index`
     this.logger = options.logger
   }
 
   public static async initialize(options: DynamoDbClientRepositoryOptions): Promise<DynamoDbClientRepository> {
     const dcr = new DynamoDbClientRepository(options)
 
-    const params: CreateTableCommandInput = {
+    await dcr.ensureTable({
       TableName: dcr.tableName,
       AttributeDefinitions: attributeDefinitions,
       KeySchema: keySchema,
-
-      // TODO: correctly define these numbers
-      ProvisionedThroughput: {
-        ReadCapacityUnits: 5,
-        WriteCapacityUnits: 5,
-      },
-    }
-
-    try {
-      const command = new CreateTableCommand(params)
-      await dcr.dynamodbClient.send(command)
-      await dcr.waitForTableToExist()
-    } catch (error) {
-      // Already exists
-      if (error instanceof Error && error.name === 'ResourceInUseException') {
-        await dcr.validateTableKeySchema()
-        return dcr
-      }
-      throw error
-    }
+      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+    })
+    await dcr.ensureTable({
+      TableName: dcr.recipientIndexTableName,
+      AttributeDefinitions: recipientIndexAttributeDefinitions,
+      KeySchema: recipientIndexKeySchema,
+      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+    })
 
     return dcr
   }
 
-  private async validateTableKeySchema(): Promise<void> {
-    const response = await this.dynamodbClient.send(
-      new DescribeTableCommand({
-        TableName: this.tableName,
-      })
-    )
+  private async ensureTable(params: CreateTableCommandInput): Promise<void> {
+    if (!params.TableName) throw new Error('DynamoDB table name is required')
+    const tableName = params.TableName
+    try {
+      await this.dynamodbClient.send(new CreateTableCommand(params))
+      await this.waitForTableToExist(tableName)
+    } catch (error) {
+      if (error instanceof Error && error.name === 'ResourceInUseException') {
+        await this.validateTableKeySchema(tableName, params.AttributeDefinitions ?? [], params.KeySchema ?? [])
+        return
+      }
+      throw error
+    }
+  }
 
+  private async validateTableKeySchema(
+    tableName: string,
+    expectedAttributeDefinitions: NonNullable<CreateTableCommandInput['AttributeDefinitions']>,
+    expectedKeySchema: NonNullable<CreateTableCommandInput['KeySchema']>
+  ): Promise<void> {
+    const response = await this.dynamodbClient.send(new DescribeTableCommand({ TableName: tableName }))
     const actualKeySchema = response.Table?.KeySchema
     const actualAttributeDefinitions = response.Table?.AttributeDefinitions
     const hasExpectedKeySchema =
-      actualKeySchema?.length === keySchema.length &&
-      keySchema.every((expectedKey) =>
+      actualKeySchema?.length === expectedKeySchema.length &&
+      expectedKeySchema.every((expectedKey) =>
         actualKeySchema.some(
           (actualKey) =>
             actualKey.AttributeName === expectedKey.AttributeName && actualKey.KeyType === expectedKey.KeyType
         )
       )
-    const hasExpectedAttributeDefinitions = attributeDefinitions.every((expectedAttribute) =>
+    const hasExpectedAttributeDefinitions = expectedAttributeDefinitions.every((expectedAttribute) =>
       actualAttributeDefinitions?.some(
         (actualAttribute) =>
           actualAttribute.AttributeName === expectedAttribute.AttributeName &&
@@ -107,9 +124,9 @@ export class DynamoDbClientRepository {
 
     if (!hasExpectedKeySchema || !hasExpectedAttributeDefinitions) {
       throw new Error(
-        `DynamoDB table ${this.tableName} has an incompatible schema. Expected key schema ${JSON.stringify(
-          keySchema
-        )} and attribute definitions ${JSON.stringify(attributeDefinitions)}, received key schema ${JSON.stringify(
+        `DynamoDB table ${tableName} has an incompatible schema. Expected key schema ${JSON.stringify(
+          expectedKeySchema
+        )} and attribute definitions ${JSON.stringify(expectedAttributeDefinitions)}, received key schema ${JSON.stringify(
           actualKeySchema
         )} and attribute definitions ${JSON.stringify(actualAttributeDefinitions)}`
       )
@@ -121,112 +138,191 @@ export class DynamoDbClientRepository {
       new QueryCommand({
         TableName: this.tableName,
         KeyConditionExpression: 'connectionId = :connectionId',
-        ExpressionAttributeValues: {
-          ':connectionId': { S: connectionId },
-        },
+        ExpressionAttributeValues: { ':connectionId': { S: connectionId } },
         ProjectionExpression: 'messageId',
         Select: 'SPECIFIC_ATTRIBUTES',
         Limit: 1,
         ScanIndexForward: false,
       })
     )
-
     return response.Items?.[0]?.messageId
   }
 
-  private async waitForTableToExist(): Promise<void> {
+  private async waitForTableToExist(tableName: string): Promise<void> {
     const startTime = Date.now()
     const maxWaitTime = 30000
-
     return new Promise((resolve, reject) => {
       const checkTableStatus = async () => {
         try {
-          const describeParams: DescribeTableCommandInput = {
-            TableName: this.tableName,
-          }
-          const command = new DescribeTableCommand(describeParams)
-          const response = await this.dynamodbClient.send(command)
-
-          if (response.Table?.TableStatus === 'ACTIVE') {
-            resolve()
-            return
-          }
-
+          const response = await this.dynamodbClient.send(
+            new DescribeTableCommand({ TableName: tableName } as DescribeTableCommandInput)
+          )
+          if (response.Table?.TableStatus === 'ACTIVE') return resolve()
           if (Date.now() - startTime > maxWaitTime) {
-            reject(new Error(`Table ${this.tableName} did not become active within ${maxWaitTime}ms`))
-            return
+            return reject(new Error(`Table ${tableName} did not become active within ${maxWaitTime}ms`))
           }
-
           setTimeout(checkTableStatus, 500)
         } catch (error) {
           reject(error)
         }
       }
-
       checkTableStatus()
     })
   }
 
+  // Existing queues are kept readable without a table scan. The first writer
+  // after this release records the greatest existing message id for its
+  // connection. Older messages are read through the legacy path until drained;
+  // newer messages use the recipient index immediately.
+  private async getRecipientIndexMetadata(connectionId: string): Promise<RecipientIndexMetadata | undefined> {
+    const response = await this.dynamodbClient.send(
+      new GetItemCommand({
+        TableName: this.recipientIndexTableName,
+        Key: marshall({ connectionId, recipientMessageId: RECIPIENT_INDEX_METADATA_KEY }),
+        ConsistentRead: true,
+      })
+    )
+    if (!response.Item) return undefined
+    return unmarshall(response.Item) as RecipientIndexMetadata
+  }
+
+  private async prepareRecipientIndex(connectionId: string): Promise<RecipientIndexMetadata> {
+    const existing = await this.getRecipientIndexMetadata(connectionId)
+    if (existing) return existing
+
+    const latestMessageId = await this.getLatestMessageId(connectionId)
+    const metadata = { cutoverMessageId: Number(latestMessageId?.N ?? 0) }
+    try {
+      await this.dynamodbClient.send(
+        new PutItemCommand({
+          TableName: this.recipientIndexTableName,
+          Item: marshall({ connectionId, recipientMessageId: RECIPIENT_INDEX_METADATA_KEY, ...metadata }),
+          ConditionExpression: 'attribute_not_exists(connectionId) AND attribute_not_exists(recipientMessageId)',
+        })
+      )
+      return metadata
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== 'ConditionalCheckFailedException') throw error
+      const concurrentMetadata = await this.getRecipientIndexMetadata(connectionId)
+      if (!concurrentMetadata) throw error
+      return concurrentMetadata
+    }
+  }
+
+  private recipientIndexSortKey(recipientDid: string, messageId: string | number): string {
+    return `${this.recipientIndexPrefix(recipientDid)}${String(messageId).padStart(16, '0')}`
+  }
+
+  private recipientIndexPrefix(recipientDid: string): string {
+    const recipientHash = createHash('sha256').update(recipientDid).digest('hex')
+    return `${RECIPIENT_INDEX_PREFIX}${recipientHash}#`
+  }
+
+  private recipientIndexRange(recipientDid: string, cutoverMessageId: number) {
+    const prefix = this.recipientIndexPrefix(recipientDid)
+    return {
+      ':recipientIndexStart': { S: `${prefix}${String(cutoverMessageId).padStart(16, '0')}` },
+      ':recipientIndexEnd': { S: `${prefix}\uffff` },
+    }
+  }
+
   async getMessageCount(connectionId: string, recipientDid?: string, maximumCount?: number): Promise<number> {
     try {
-      const params: QueryCommandInput = {
-        TableName: this.tableName,
-        KeyConditionExpression: 'connectionId = :connectionId',
-        ExpressionAttributeValues: {
-          ':connectionId': { S: connectionId },
-        },
-        Select: 'COUNT',
-      }
+      if (recipientDid === undefined) return await this.countMessagesByConnection(connectionId, maximumCount)
 
-      if (recipientDid !== undefined) {
-        const latestMessageId = await this.getLatestMessageId(connectionId)
-        if (!latestMessageId) return 0
+      const metadata = await this.getRecipientIndexMetadata(connectionId)
+      if (!metadata) return await this.countLegacyRecipientMessages(connectionId, recipientDid, undefined, maximumCount)
 
-        params.KeyConditionExpression += ' AND messageId <= :latestMessageId'
-        params.FilterExpression = 'contains(recipientDids, :recipientDid)'
-        params.ExpressionAttributeValues = {
-          ...params.ExpressionAttributeValues,
-          ':recipientDid': { S: recipientDid },
-          ':latestMessageId': latestMessageId,
-        }
-      } else {
-        params.Limit = maximumCount
-      }
-
-      let count = 0
-      let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey']
-
-      do {
-        const previousLastEvaluatedKey = lastEvaluatedKey
-        const command = new QueryCommand({
-          ...params,
-          ExclusiveStartKey: lastEvaluatedKey,
-        })
-        const response = await this.dynamodbClient.send(command)
-
-        count += response.Count || 0
-        lastEvaluatedKey = response.LastEvaluatedKey
-
-        if (maximumCount !== undefined && count >= maximumCount) {
-          return maximumCount
-        }
-
-        if (
-          lastEvaluatedKey &&
-          previousLastEvaluatedKey &&
-          JSON.stringify(lastEvaluatedKey) === JSON.stringify(previousLastEvaluatedKey)
-        ) {
-          throw new Error(
-            `DynamoDB returned a non-advancing pagination key while counting messages for connection ${connectionId}`
-          )
-        }
-      } while (lastEvaluatedKey)
-
-      return count
+      const indexed = await this.countIndexedRecipientMessages(
+        connectionId,
+        recipientDid,
+        metadata.cutoverMessageId,
+        maximumCount
+      )
+      if (maximumCount !== undefined && indexed >= maximumCount) return maximumCount
+      const legacy = await this.countLegacyRecipientMessages(
+        connectionId,
+        recipientDid,
+        metadata.cutoverMessageId,
+        maximumCount === undefined ? undefined : maximumCount - indexed
+      )
+      return indexed + legacy
     } catch (error) {
       this.logger.error('Error getting entries count:', { error })
       throw error
     }
+  }
+
+  private async countMessagesByConnection(connectionId: string, maximumCount?: number): Promise<number> {
+    return this.countQuery(
+      {
+        TableName: this.tableName,
+        KeyConditionExpression: 'connectionId = :connectionId',
+        ExpressionAttributeValues: { ':connectionId': { S: connectionId } },
+      },
+      maximumCount
+    )
+  }
+
+  private async countIndexedRecipientMessages(
+    connectionId: string,
+    recipientDid: string,
+    cutoverMessageId: number,
+    maximumCount?: number
+  ): Promise<number> {
+    return this.countQuery(
+      {
+        TableName: this.recipientIndexTableName,
+        KeyConditionExpression:
+          'connectionId = :connectionId AND recipientMessageId BETWEEN :recipientIndexStart AND :recipientIndexEnd',
+        ExpressionAttributeValues: {
+          ':connectionId': { S: connectionId },
+          ...this.recipientIndexRange(recipientDid, cutoverMessageId),
+        },
+      },
+      maximumCount
+    )
+  }
+
+  private async countLegacyRecipientMessages(
+    connectionId: string,
+    recipientDid: string,
+    cutoverMessageId?: number,
+    maximumCount?: number
+  ): Promise<number> {
+    const params: QueryCommandInput = {
+      TableName: this.tableName,
+      KeyConditionExpression:
+        cutoverMessageId === undefined
+          ? 'connectionId = :connectionId'
+          : 'connectionId = :connectionId AND messageId <= :cutoverMessageId',
+      FilterExpression: 'contains(recipientDids, :recipientDid)',
+      ExpressionAttributeValues: {
+        ':connectionId': { S: connectionId },
+        ':recipientDid': { S: recipientDid },
+        ...(cutoverMessageId === undefined ? {} : { ':cutoverMessageId': { N: String(cutoverMessageId) } }),
+      },
+    }
+    return this.countQuery(params, maximumCount)
+  }
+
+  private async countQuery(params: QueryCommandInput, maximumCount?: number): Promise<number> {
+    let count = 0
+    let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey']
+    do {
+      const response = await this.dynamodbClient.send(
+        new QueryCommand({
+          ...params,
+          Select: 'COUNT',
+          Limit: maximumCount === undefined ? undefined : maximumCount - count,
+          ExclusiveStartKey: lastEvaluatedKey,
+        })
+      )
+      count += response.Count || 0
+      lastEvaluatedKey = response.LastEvaluatedKey
+      if (maximumCount !== undefined && count >= maximumCount) return maximumCount
+    } while (lastEvaluatedKey)
+    return count
   }
 
   async getMessages(options: {
@@ -235,105 +331,250 @@ export class DynamoDbClientRepository {
     recipientDid?: string
     deleteMessages?: boolean
   }) {
+    const messages =
+      options.recipientDid === undefined
+        ? await this.getMessagesByConnection(options.connectionId, options.limit)
+        : await this.getRecipientMessages(options.connectionId, options.recipientDid, options.limit)
+
+    if (options.deleteMessages && messages.length > 0) {
+      await this.removeMessages({
+        connectionId: options.connectionId,
+        messageIds: messages.map((message) => message.id),
+      })
+    }
+    return messages
+  }
+
+  private async getMessagesByConnection(connectionId: string, limit?: number): Promise<QueuedMessage[]> {
+    const response = await this.dynamodbClient.send(
+      new QueryCommand({
+        TableName: this.tableName,
+        KeyConditionExpression: 'connectionId = :connectionId',
+        ExpressionAttributeValues: { ':connectionId': { S: connectionId } },
+        Limit: limit,
+      })
+    )
+    return this.toQueuedMessages(response.Items)
+  }
+
+  private async getRecipientMessages(
+    connectionId: string,
+    recipientDid: string,
+    limit?: number
+  ): Promise<QueuedMessage[]> {
+    const metadata = await this.getRecipientIndexMetadata(connectionId)
+    if (!metadata) return await this.getLegacyRecipientMessages(connectionId, recipientDid, undefined, limit)
+
+    // Old messages sort before the post-cutover indexed entries, so read them
+    // first to retain the queue's FIFO ordering while they drain.
+    const legacy = await this.getLegacyRecipientMessages(connectionId, recipientDid, metadata.cutoverMessageId, limit)
+    if (limit !== undefined && legacy.length >= limit) return legacy
+
+    const indexed = await this.getIndexedRecipientMessages(
+      connectionId,
+      recipientDid,
+      metadata.cutoverMessageId,
+      limit === undefined ? undefined : limit - legacy.length
+    )
+    return [...legacy, ...indexed]
+  }
+
+  private async getLegacyRecipientMessages(
+    connectionId: string,
+    recipientDid: string,
+    cutoverMessageId?: number,
+    limit?: number
+  ): Promise<QueuedMessage[]> {
     const queryParams: QueryCommandInput = {
       TableName: this.tableName,
-      KeyConditionExpression: 'connectionId = :connectionId',
+      KeyConditionExpression:
+        cutoverMessageId === undefined
+          ? 'connectionId = :connectionId'
+          : 'connectionId = :connectionId AND messageId <= :cutoverMessageId',
+      FilterExpression: 'contains(recipientDids, :recipientDid)',
       ExpressionAttributeValues: {
-        ':connectionId': { S: options.connectionId },
+        ':connectionId': { S: connectionId },
+        ':recipientDid': { S: recipientDid },
+        ...(cutoverMessageId === undefined ? {} : { ':cutoverMessageId': { N: String(cutoverMessageId) } }),
       },
     }
+    return this.queryMessages(queryParams, limit)
+  }
 
-    if (options.recipientDid !== undefined) {
-      const latestMessageId = await this.getLatestMessageId(options.connectionId)
-      if (!latestMessageId) return []
+  private async getIndexedRecipientMessages(
+    connectionId: string,
+    recipientDid: string,
+    cutoverMessageId: number,
+    limit?: number
+  ): Promise<QueuedMessage[]> {
+    const indexEntries = await this.queryRecipientIndex(connectionId, recipientDid, cutoverMessageId, limit)
+    if (indexEntries.length === 0) return []
+    const messages = await this.batchGetMessages(
+      connectionId,
+      indexEntries.map((entry) => entry.messageId)
+    )
+    const byId = new Map(messages.map((message) => [message.id, message]))
+    return indexEntries.flatMap((entry) => {
+      const message = byId.get(entry.messageId)
+      return message ? [message] : []
+    })
+  }
 
-      queryParams.KeyConditionExpression += ' AND messageId <= :latestMessageId'
-      queryParams.FilterExpression = 'contains(recipientDids, :recipientDid)'
-      queryParams.ExpressionAttributeValues = {
-        ...queryParams.ExpressionAttributeValues,
-        ':recipientDid': { S: options.recipientDid },
-        ':latestMessageId': latestMessageId,
-      }
-    } else {
-      queryParams.Limit = options.limit
-    }
-
-    const messages: QueuedMessage[] = []
+  private async queryRecipientIndex(
+    connectionId: string,
+    recipientDid: string,
+    cutoverMessageId: number,
+    limit?: number
+  ): Promise<RecipientIndexEntry[]> {
+    const entries: RecipientIndexEntry[] = []
     let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey']
-
     do {
       const response = await this.dynamodbClient.send(
         new QueryCommand({
-          ...queryParams,
+          TableName: this.recipientIndexTableName,
+          KeyConditionExpression:
+            'connectionId = :connectionId AND recipientMessageId BETWEEN :recipientIndexStart AND :recipientIndexEnd',
+          ExpressionAttributeValues: {
+            ':connectionId': { S: connectionId },
+            ...this.recipientIndexRange(recipientDid, cutoverMessageId),
+          },
+          ProjectionExpression: 'messageId',
+          Limit: limit === undefined ? undefined : limit - entries.length,
           ExclusiveStartKey: lastEvaluatedKey,
         })
       )
-
-      messages.push(
-        ...(response.Items?.map((item) => unmarshall(item)) || []).map(
-          (item) =>
-            ({
-              ...item,
-              receivedAt: new Date(item.receivedAt),
-              id: item.messageId.toString(),
-            }) as unknown as QueuedMessage
-        )
-      )
+      entries.push(...(response.Items ?? []).map((item) => ({ messageId: unmarshall(item).messageId.toString() })))
       lastEvaluatedKey = response.LastEvaluatedKey
-    } while (
-      options.recipientDid !== undefined &&
-      lastEvaluatedKey &&
-      (options.limit === undefined || messages.length < options.limit)
-    )
+    } while (lastEvaluatedKey && (limit === undefined || entries.length < limit))
+    return entries
+  }
 
-    const messagesToReturn = options.limit === undefined ? messages : messages.slice(0, options.limit)
+  private async queryMessages(params: QueryCommandInput, limit?: number): Promise<QueuedMessage[]> {
+    const messages: QueuedMessage[] = []
+    let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey']
+    do {
+      const response = await this.dynamodbClient.send(
+        new QueryCommand({ ...params, ExclusiveStartKey: lastEvaluatedKey })
+      )
+      messages.push(...this.toQueuedMessages(response.Items))
+      lastEvaluatedKey = response.LastEvaluatedKey
+    } while (lastEvaluatedKey && (limit === undefined || messages.length < limit))
+    return limit === undefined ? messages : messages.slice(0, limit)
+  }
 
-    if (options.deleteMessages && messagesToReturn.length > 0) {
-      await this.removeMessages({
-        connectionId: options.connectionId,
-        messageIds: messagesToReturn.map((m) => m.id),
-      })
+  private toQueuedMessages(items: Record<string, unknown>[] | undefined): QueuedMessage[] {
+    return (items ?? []).map((item) => {
+      const message = unmarshall(item as never) as unknown as Record<string, unknown>
+      return {
+        ...message,
+        receivedAt: new Date(message.receivedAt as number),
+        id: String(message.messageId),
+      } as QueuedMessage
+    })
+  }
+
+  private async batchGetMessages(connectionId: string, messageIds: string[]): Promise<QueuedMessage[]> {
+    const messages: QueuedMessage[] = []
+    for (let index = 0; index < messageIds.length; index += 100) {
+      const keys = messageIds
+        .slice(index, index + 100)
+        .map((messageId) => marshall({ connectionId, messageId: Number(messageId) }))
+      let requestItems = { [this.tableName]: { Keys: keys } }
+      while (true) {
+        const response = await this.dynamodbClient.send(new BatchGetItemCommand({ RequestItems: requestItems }))
+        messages.push(...this.toQueuedMessages(response.Responses?.[this.tableName]))
+        const unprocessedKeys = response.UnprocessedKeys?.[this.tableName]?.Keys
+        if (!unprocessedKeys || unprocessedKeys.length === 0) break
+        requestItems = { [this.tableName]: { Keys: unprocessedKeys } }
+      }
     }
-
-    return messagesToReturn
+    return messages
   }
 
   async addMessage(options: AddQueuedMessageOptions): Promise<string> {
+    const metadata = await this.prepareRecipientIndex(options.connectionId)
     const randomizer = randomInt(0, 999).toString().padStart(3, '0')
     const receivedAt = options.receivedAt ?? new Date()
     const messageId = `${receivedAt.getTime()}${randomizer}`
-    const updateItemCommand = new UpdateItemCommand({
-      TableName: this.tableName,
-      Key: marshall({
-        connectionId: options.connectionId,
-        messageId: Number(messageId),
-      }),
-      UpdateExpression: 'set encryptedMessage = :em, recipientDids = :rd, receivedAt = :ra',
-      ExpressionAttributeValues: marshall({
-        ':em': options.encryptedMessage,
-        ':rd': options.recipientDids,
-        ':ra': receivedAt.getTime(),
-      }),
-    })
+    await this.dynamodbClient.send(
+      new UpdateItemCommand({
+        TableName: this.tableName,
+        Key: marshall({ connectionId: options.connectionId, messageId: Number(messageId) }),
+        UpdateExpression: 'set encryptedMessage = :em, recipientDids = :rd, receivedAt = :ra',
+        ExpressionAttributeValues: marshall({
+          ':em': options.encryptedMessage,
+          ':rd': options.recipientDids,
+          ':ra': receivedAt.getTime(),
+        }),
+      })
+    )
 
-    await this.dynamodbClient.send(updateItemCommand)
-
+    // Index entries only cover messages after the cutover. A caller may supply
+    // an old receivedAt in tests or a replay, in which case the legacy path
+    // remains authoritative and preserves correctness.
+    if (Number(messageId) > metadata.cutoverMessageId) {
+      await this.batchWrite(
+        options.recipientDids.map((recipientDid) => ({
+          PutRequest: {
+            Item: marshall({
+              connectionId: options.connectionId,
+              recipientMessageId: this.recipientIndexSortKey(recipientDid, messageId),
+              messageId: Number(messageId),
+            }),
+          },
+        })),
+        this.recipientIndexTableName
+      )
+    }
     return messageId
   }
 
   async removeMessages(options: RemoveQueuedMessageOptions): Promise<void> {
-    const deleteRequests = options.messageIds.map((messageId) => {
-      const deleteParams: DeleteItemCommandInput = {
-        TableName: this.tableName,
-        Key: marshall({
-          connectionId: options.connectionId,
-          messageId: Number(messageId),
-        }),
-      }
+    const messages = await this.batchGetMessages(options.connectionId, options.messageIds)
+    const deleteRequests = [
+      ...options.messageIds.map((messageId) => ({
+        tableName: this.tableName,
+        request: {
+          DeleteRequest: { Key: marshall({ connectionId: options.connectionId, messageId: Number(messageId) }) },
+        },
+      })),
+      ...messages.flatMap((message) =>
+        message.recipientDids.map((recipientDid) => ({
+          tableName: this.recipientIndexTableName,
+          request: {
+            DeleteRequest: {
+              Key: marshall({
+                connectionId: options.connectionId,
+                recipientMessageId: this.recipientIndexSortKey(recipientDid, message.id),
+              }),
+            },
+          },
+        }))
+      ),
+    ]
+    for (let index = 0; index < deleteRequests.length; index += 25) {
+      const requests = deleteRequests.slice(index, index + 25)
+      const requestItems = requests.reduce<Record<string, Array<Record<string, unknown>>>>((items, item) => {
+        const tableRequests = items[item.tableName] ?? []
+        tableRequests.push(item.request)
+        items[item.tableName] = tableRequests
+        return items
+      }, {})
+      await this.batchWriteItems(requestItems)
+    }
+  }
 
-      return this.dynamodbClient.send(new DeleteItemCommand(deleteParams))
-    })
+  private async batchWrite(requests: Array<Record<string, unknown>>, tableName: string): Promise<void> {
+    for (let index = 0; index < requests.length; index += 25) {
+      await this.batchWriteItems({ [tableName]: requests.slice(index, index + 25) })
+    }
+  }
 
-    await Promise.all(deleteRequests)
+  private async batchWriteItems(requestItems: Record<string, Array<Record<string, unknown>>>): Promise<void> {
+    let pending = requestItems
+    do {
+      const response = await this.dynamodbClient.send(new BatchWriteItemCommand({ RequestItems: pending as never }))
+      pending = (response.UnprocessedItems ?? {}) as Record<string, Array<Record<string, unknown>>>
+    } while (Object.keys(pending).length > 0)
   }
 }
