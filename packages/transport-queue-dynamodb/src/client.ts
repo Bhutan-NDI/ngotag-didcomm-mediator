@@ -12,6 +12,7 @@ import {
   PutItemCommand,
   QueryCommand,
   QueryCommandInput,
+  TransactWriteItemsCommand,
   UpdateItemCommand,
 } from '@aws-sdk/client-dynamodb'
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb'
@@ -80,7 +81,10 @@ export class DynamoDbClientRepository {
       TableName: dcr.recipientIndexTableName,
       AttributeDefinitions: recipientIndexAttributeDefinitions,
       KeySchema: recipientIndexKeySchema,
-      ProvisionedThroughput: { ReadCapacityUnits: 5, WriteCapacityUnits: 5 },
+      // Recipient index writes fan out per recipient DID. On-demand billing
+      // lets an auto-created companion table absorb that variable write rate
+      // without inheriting the primary table's placeholder 5-WCU ceiling.
+      BillingMode: 'PAY_PER_REQUEST',
     })
 
     return dcr
@@ -317,17 +321,22 @@ export class DynamoDbClientRepository {
     let count = 0
     let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey']
     do {
+      const previousLastEvaluatedKey = lastEvaluatedKey
       const response = await this.dynamodbClient.send(
         new QueryCommand({
           ...params,
           Select: 'COUNT',
-          Limit: maximumCount === undefined ? undefined : maximumCount - count,
+          // DynamoDB applies Limit before FilterExpression. Limiting a sparse
+          // legacy recipient query to (for example) 10 evaluated items would
+          // create many tiny pages, so filtered queries retain full pages.
+          Limit: maximumCount === undefined || params.FilterExpression !== undefined ? undefined : maximumCount - count,
           ExclusiveStartKey: lastEvaluatedKey,
         })
       )
       count += response.Count || 0
       lastEvaluatedKey = response.LastEvaluatedKey
       if (maximumCount !== undefined && count >= maximumCount) return maximumCount
+      this.assertPaginationAdvanced(previousLastEvaluatedKey, lastEvaluatedKey, params.TableName)
     } while (lastEvaluatedKey)
     return count
   }
@@ -436,6 +445,7 @@ export class DynamoDbClientRepository {
     const entries: RecipientIndexEntry[] = []
     let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey']
     do {
+      const previousLastEvaluatedKey = lastEvaluatedKey
       const response = await this.dynamodbClient.send(
         new QueryCommand({
           TableName: this.recipientIndexTableName,
@@ -452,6 +462,9 @@ export class DynamoDbClientRepository {
       )
       entries.push(...(response.Items ?? []).map((item) => ({ messageId: unmarshall(item).messageId.toString() })))
       lastEvaluatedKey = response.LastEvaluatedKey
+      if (lastEvaluatedKey && (limit === undefined || entries.length < limit)) {
+        this.assertPaginationAdvanced(previousLastEvaluatedKey, lastEvaluatedKey, this.recipientIndexTableName)
+      }
     } while (lastEvaluatedKey && (limit === undefined || entries.length < limit))
     return entries
   }
@@ -460,11 +473,15 @@ export class DynamoDbClientRepository {
     const messages: QueuedMessage[] = []
     let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey']
     do {
+      const previousLastEvaluatedKey = lastEvaluatedKey
       const response = await this.dynamodbClient.send(
         new QueryCommand({ ...params, ExclusiveStartKey: lastEvaluatedKey })
       )
       messages.push(...this.toQueuedMessages(response.Items))
       lastEvaluatedKey = response.LastEvaluatedKey
+      if (lastEvaluatedKey && (limit === undefined || messages.length < limit)) {
+        this.assertPaginationAdvanced(previousLastEvaluatedKey, lastEvaluatedKey, params.TableName)
+      }
     } while (lastEvaluatedKey && (limit === undefined || messages.length < limit))
     return limit === undefined ? messages : messages.slice(0, limit)
   }
@@ -486,7 +503,7 @@ export class DynamoDbClientRepository {
       const keys = messageIds
         .slice(index, index + 100)
         .map((messageId) => marshall({ connectionId, messageId: Number(messageId) }))
-      let requestItems = { [this.tableName]: { Keys: keys } }
+      let requestItems = { [this.tableName]: { Keys: keys, ConsistentRead: true } }
       let retryAttempt = 0
       while (true) {
         const response = await this.dynamodbClient.send(new BatchGetItemCommand({ RequestItems: requestItems }))
@@ -494,7 +511,7 @@ export class DynamoDbClientRepository {
         const unprocessedKeys = response.UnprocessedKeys?.[this.tableName]?.Keys
         if (!unprocessedKeys || unprocessedKeys.length === 0) break
         await this.waitForUnprocessedItems('BatchGetItem', retryAttempt++)
-        requestItems = { [this.tableName]: { Keys: unprocessedKeys } }
+        requestItems = { [this.tableName]: { Keys: unprocessedKeys, ConsistentRead: true } }
       }
     }
     return messages
@@ -505,78 +522,95 @@ export class DynamoDbClientRepository {
     const randomizer = randomInt(0, 999).toString().padStart(3, '0')
     const receivedAt = options.receivedAt ?? new Date()
     const messageId = `${receivedAt.getTime()}${randomizer}`
-    await this.dynamodbClient.send(
-      new UpdateItemCommand({
-        TableName: this.tableName,
-        Key: marshall({ connectionId: options.connectionId, messageId: Number(messageId) }),
-        UpdateExpression: 'set encryptedMessage = :em, recipientDids = :rd, receivedAt = :ra',
-        ExpressionAttributeValues: marshall({
-          ':em': options.encryptedMessage,
-          ':rd': options.recipientDids,
-          ':ra': receivedAt.getTime(),
-        }),
-      })
-    )
+    const messageUpdate = {
+      TableName: this.tableName,
+      Key: marshall({ connectionId: options.connectionId, messageId: Number(messageId) }),
+      UpdateExpression: 'set encryptedMessage = :em, recipientDids = :rd, receivedAt = :ra',
+      ExpressionAttributeValues: marshall({
+        ':em': options.encryptedMessage,
+        ':rd': options.recipientDids,
+        ':ra': receivedAt.getTime(),
+      }),
+    }
 
     // Index entries only cover messages after the cutover. A caller may supply
     // an old receivedAt in tests or a replay, in which case the legacy path
     // remains authoritative and preserves correctness.
     if (Number(messageId) > metadata.cutoverMessageId) {
-      await this.batchWrite(
-        options.recipientDids.map((recipientDid) => ({
-          PutRequest: {
-            Item: marshall({
-              connectionId: options.connectionId,
-              recipientMessageId: this.recipientIndexSortKey(recipientDid, messageId),
-              messageId: Number(messageId),
-            }),
-          },
-        })),
-        this.recipientIndexTableName
+      const recipientDids = [...new Set(options.recipientDids)]
+      // DynamoDB transactions support at most 100 actions. Reserve one for the
+      // canonical message and fail before writing anything if this is exceeded.
+      if (recipientDids.length > 99) {
+        throw new Error('A queued message cannot have more than 99 unique recipient DIDs')
+      }
+
+      // Commit the canonical item and all recipient pointers atomically. A
+      // failed index write can therefore never leave a durable message that is
+      // newer than the cutover but invisible to recipient-scoped reads.
+      await this.dynamodbClient.send(
+        new TransactWriteItemsCommand({
+          ClientRequestToken: createHash('sha256')
+            .update(`${options.connectionId}:${messageId}`)
+            .digest('hex')
+            .slice(0, 36),
+          TransactItems: [
+            { Update: messageUpdate },
+            ...recipientDids.map((recipientDid) => ({
+              Put: {
+                TableName: this.recipientIndexTableName,
+                Item: marshall({
+                  connectionId: options.connectionId,
+                  recipientMessageId: this.recipientIndexSortKey(recipientDid, messageId),
+                  messageId: Number(messageId),
+                }),
+              },
+            })),
+          ],
+        })
       )
+    } else {
+      await this.dynamodbClient.send(new UpdateItemCommand(messageUpdate))
     }
     return messageId
   }
 
   async removeMessages(options: RemoveQueuedMessageOptions): Promise<void> {
-    const messages = await this.batchGetMessages(options.connectionId, options.messageIds)
-    const deleteRequests = [
-      ...options.messageIds.map((messageId) => ({
-        tableName: this.tableName,
-        request: {
-          DeleteRequest: { Key: marshall({ connectionId: options.connectionId, messageId: Number(messageId) }) },
-        },
-      })),
-      ...messages.flatMap((message) =>
-        message.recipientDids.map((recipientDid) => ({
-          tableName: this.recipientIndexTableName,
-          request: {
-            DeleteRequest: {
-              Key: marshall({
-                connectionId: options.connectionId,
-                recipientMessageId: this.recipientIndexSortKey(recipientDid, message.id),
-              }),
-            },
+    const messageIds = [...new Set(options.messageIds)]
+    const messages = await this.batchGetMessages(options.connectionId, messageIds)
+
+    // Delete recipient pointers first. If this phase partially fails, every
+    // canonical item remains available so a retry can reconstruct and reissue
+    // every pointer deletion. This avoids permanent orphan index entries.
+    await this.batchWrite(
+      messages.flatMap((message) =>
+        [...new Set(message.recipientDids)].map((recipientDid) => ({
+          DeleteRequest: {
+            Key: marshall({
+              connectionId: options.connectionId,
+              recipientMessageId: this.recipientIndexSortKey(recipientDid, message.id),
+            }),
           },
         }))
       ),
-    ]
-    for (let index = 0; index < deleteRequests.length; index += 25) {
-      const requests = deleteRequests.slice(index, index + 25)
-      const requestItems = requests.reduce<Record<string, Array<Record<string, unknown>>>>((items, item) => {
-        const tableRequests = items[item.tableName] ?? []
-        tableRequests.push(item.request)
-        items[item.tableName] = tableRequests
-        return items
-      }, {})
-      await this.batchWriteItems(requestItems)
-    }
+      this.recipientIndexTableName
+    )
+
+    await this.batchWrite(
+      messageIds.map((messageId) => ({
+        DeleteRequest: { Key: marshall({ connectionId: options.connectionId, messageId: Number(messageId) }) },
+      })),
+      this.tableName
+    )
   }
 
   private async batchWrite(requests: Array<Record<string, unknown>>, tableName: string): Promise<void> {
+    const batches: Array<Promise<void>> = []
     for (let index = 0; index < requests.length; index += 25) {
-      await this.batchWriteItems({ [tableName]: requests.slice(index, index + 25) })
+      batches.push(this.batchWriteItems({ [tableName]: requests.slice(index, index + 25) }))
     }
+    const results = await Promise.allSettled(batches)
+    const failedResult = results.find((result) => result.status === 'rejected')
+    if (failedResult) throw failedResult.reason
   }
 
   private async batchWriteItems(requestItems: Record<string, Array<Record<string, unknown>>>): Promise<void> {
@@ -606,5 +640,15 @@ export class DynamoDbClientRepository {
     // storms from mediators that were throttled at the same time.
     const delayMs = Math.floor(exponentialDelay / 2 + Math.random() * (exponentialDelay / 2))
     await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+  }
+
+  private assertPaginationAdvanced(
+    previousKey: QueryCommandInput['ExclusiveStartKey'],
+    currentKey: QueryCommandInput['ExclusiveStartKey'],
+    tableName: string | undefined
+  ): void {
+    if (previousKey && currentKey && JSON.stringify(previousKey) === JSON.stringify(currentKey)) {
+      throw new Error(`DynamoDB returned a non-advancing pagination key while querying ${tableName ?? 'a table'}`)
+    }
   }
 }

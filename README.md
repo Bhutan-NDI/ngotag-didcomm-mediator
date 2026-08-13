@@ -240,6 +240,7 @@ When running the Askar to Drizzle storage delettion after successul migration fr
   - For `postgres`: `host`, `user`, `password`, `database`
   - For `dynamodb`: `region`, `accessKeyId`, `secretAccessKey`, `tableName`, `recipientIndexTableName` (optional)
     - The mediator creates a companion recipient index table named `<tableName>_recipient_index` by default. It lets recipient-DID pickup use a DynamoDB key condition rather than reading and filtering every queued message for the connection.
+    - An automatically created companion table uses DynamoDB on-demand billing because each queued message can fan out to multiple recipient-index writes. A table provisioned separately through infrastructure as code keeps its configured billing mode and capacity.
     - Set `recipientIndexTableName` when the companion table must use a different name. The DynamoDB principal needs the same create, describe, read, and write permissions for this table as for `tableName`.
 - `multiInstanceDelivery.type`: `none` or `redis`.
   - `none`. In this case multi instance delivery is not enabled. Use this if you're using `postgres` for `messagePickup.storage.type`, or if only deploying a single instance.
