@@ -1,5 +1,6 @@
 import {
   BatchGetItemCommand,
+  BatchWriteItemCommand,
   CreateTableCommand,
   DescribeTableCommand,
   DynamoDBClient,
@@ -19,6 +20,32 @@ const clientOptions = {
 }
 
 suite('dynamodb recipient index', () => {
+  test('uses a strongly consistent read to establish the migration cutover', async () => {
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof QueryCommand) return { Items: [{ messageId: { N: '42' } }] } as never
+      return {} as never
+    })
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      const getLatestMessageId = client as unknown as {
+        getLatestMessageId: (connection: string) => Promise<{ N: string } | undefined>
+      }
+
+      expect(await getLatestMessageId.getLatestMessageId(connectionId)).toEqual({ N: '42' })
+
+      const latestMessageQuery = send.mock.calls
+        .map(([command]) => command as unknown)
+        .find((command) => command instanceof QueryCommand)
+      const latestMessageQueryInput = latestMessageQuery instanceof QueryCommand ? latestMessageQuery.input : undefined
+      expect(latestMessageQueryInput?.ConsistentRead).toBe(true)
+    } finally {
+      send.mockRestore()
+    }
+  })
+
   test('creates the companion recipient index table', async () => {
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
@@ -165,6 +192,72 @@ suite('dynamodb recipient index', () => {
       const recipientQueryInput = recipientQuery instanceof QueryCommand ? recipientQuery.input : undefined
       expect(recipientQueryInput?.FilterExpression).toBeUndefined()
     } finally {
+      send.mockRestore()
+    }
+  })
+
+  test('retries unprocessed batch writes with backoff', async () => {
+    let batchWriteCount = 0
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof BatchWriteItemCommand) {
+        batchWriteCount += 1
+        return batchWriteCount === 1 ? { UnprocessedItems: command.input.RequestItems } : ({} as never)
+      }
+      return {} as never
+    })
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      const batchWriteItems = client as unknown as {
+        batchWriteItems: (requests: Record<string, Array<Record<string, unknown>>>) => Promise<void>
+      }
+
+      await expect(
+        batchWriteItems.batchWriteItems({
+          queued_messages: [{ PutRequest: { Item: { connectionId: { S: connectionId } } } }],
+        })
+      ).resolves.toBeUndefined()
+      expect(batchWriteCount).toBe(2)
+    } finally {
+      random.mockRestore()
+      send.mockRestore()
+    }
+  })
+
+  test('fails after the capped number of unprocessed batch-write retries', async () => {
+    let batchWriteCount = 0
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof BatchWriteItemCommand) {
+        batchWriteCount += 1
+        return { UnprocessedItems: command.input.RequestItems } as never
+      }
+      return {} as never
+    })
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
+    vi.useFakeTimers()
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      const batchWriteItems = client as unknown as {
+        batchWriteItems: (requests: Record<string, Array<Record<string, unknown>>>) => Promise<void>
+      }
+
+      const batchWrite = batchWriteItems.batchWriteItems({
+        queued_messages: [{ PutRequest: { Item: { connectionId: { S: connectionId } } } }],
+      })
+      const expectedFailure = expect(batchWrite).rejects.toThrow('BatchWriteItem exceeded 8 retries')
+      await vi.runAllTimersAsync()
+
+      await expectedFailure
+      expect(batchWriteCount).toBe(9)
+    } finally {
+      vi.useRealTimers()
+      random.mockRestore()
       send.mockRestore()
     }
   })

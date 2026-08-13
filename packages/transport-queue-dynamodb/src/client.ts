@@ -50,6 +50,9 @@ type RecipientIndexEntry = { messageId: string }
 
 const RECIPIENT_INDEX_METADATA_KEY = '__recipient_index_metadata__'
 const RECIPIENT_INDEX_PREFIX = 'r#'
+const MAX_UNPROCESSED_ITEM_RETRIES = 8
+const INITIAL_UNPROCESSED_ITEM_RETRY_DELAY_MS = 50
+const MAX_UNPROCESSED_ITEM_RETRY_DELAY_MS = 2_000
 
 export class DynamoDbClientRepository {
   private dynamodbClient: DynamoDBClient
@@ -143,6 +146,10 @@ export class DynamoDbClientRepository {
         Select: 'SPECIFIC_ATTRIBUTES',
         Limit: 1,
         ScanIndexForward: false,
+        // This result fixes the migration boundary for a connection. It must
+        // include every pre-index message so none can become invisible to a
+        // recipient-specific pickup after the cutover is recorded.
+        ConsistentRead: true,
       })
     )
     return response.Items?.[0]?.messageId
@@ -480,11 +487,13 @@ export class DynamoDbClientRepository {
         .slice(index, index + 100)
         .map((messageId) => marshall({ connectionId, messageId: Number(messageId) }))
       let requestItems = { [this.tableName]: { Keys: keys } }
+      let retryAttempt = 0
       while (true) {
         const response = await this.dynamodbClient.send(new BatchGetItemCommand({ RequestItems: requestItems }))
         messages.push(...this.toQueuedMessages(response.Responses?.[this.tableName]))
         const unprocessedKeys = response.UnprocessedKeys?.[this.tableName]?.Keys
         if (!unprocessedKeys || unprocessedKeys.length === 0) break
+        await this.waitForUnprocessedItems('BatchGetItem', retryAttempt++)
         requestItems = { [this.tableName]: { Keys: unprocessedKeys } }
       }
     }
@@ -572,9 +581,30 @@ export class DynamoDbClientRepository {
 
   private async batchWriteItems(requestItems: Record<string, Array<Record<string, unknown>>>): Promise<void> {
     let pending = requestItems
-    do {
+    let retryAttempt = 0
+    while (Object.keys(pending).length > 0) {
       const response = await this.dynamodbClient.send(new BatchWriteItemCommand({ RequestItems: pending as never }))
       pending = (response.UnprocessedItems ?? {}) as Record<string, Array<Record<string, unknown>>>
-    } while (Object.keys(pending).length > 0)
+      if (Object.keys(pending).length === 0) return
+      await this.waitForUnprocessedItems('BatchWriteItem', retryAttempt++)
+    }
+  }
+
+  private async waitForUnprocessedItems(operation: string, retryAttempt: number): Promise<void> {
+    if (retryAttempt >= MAX_UNPROCESSED_ITEM_RETRIES) {
+      this.logger.error(`${operation} still has unprocessed items after retries`, {
+        retryAttempts: retryAttempt + 1,
+      })
+      throw new Error(`${operation} exceeded ${MAX_UNPROCESSED_ITEM_RETRIES} retries for unprocessed items`)
+    }
+
+    const exponentialDelay = Math.min(
+      INITIAL_UNPROCESSED_ITEM_RETRY_DELAY_MS * 2 ** retryAttempt,
+      MAX_UNPROCESSED_ITEM_RETRY_DELAY_MS
+    )
+    // Equal jitter provides a growing delay while avoiding synchronized retry
+    // storms from mediators that were throttled at the same time.
+    const delayMs = Math.floor(exponentialDelay / 2 + Math.random() * (exponentialDelay / 2))
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
   }
 }
