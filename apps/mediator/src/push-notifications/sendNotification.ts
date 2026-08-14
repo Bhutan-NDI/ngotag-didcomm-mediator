@@ -1,7 +1,48 @@
 import { AgentContext } from '@credo-ts/core'
 import { DidCommPushNotificationsFcmRepository } from '@credo-ts/didcomm-push-notifications'
 import { config } from '../config.js'
+import {
+  elapsedSeconds,
+  hashIdentifier,
+  pushNotificationCounter,
+  pushNotificationDuration,
+  SpanKind,
+  SpanStatusCode,
+  withSpan,
+} from '../telemetry/api.js'
 import { sendFcmPushNotification } from './fcm/events/PushNotificationEvent.js'
+
+async function instrumentPush<T>(
+  channel: 'webhook' | 'fcm',
+  connectionId: string,
+  callback: () => Promise<T>,
+  isSuccess: (result: T) => boolean
+): Promise<T> {
+  const startedAt = process.hrtime.bigint()
+  return withSpan(
+    `didcomm.push.${channel}`,
+    {
+      kind: SpanKind.CLIENT,
+      attributes: {
+        'didcomm.push.channel': channel,
+        'didcomm.connection.id_hash': hashIdentifier(connectionId),
+      },
+    },
+    async (span) => {
+      let outcome = 'error'
+      try {
+        const result = await callback()
+        outcome = isSuccess(result) ? 'ok' : 'error'
+        if (outcome === 'error') span.setStatus({ code: SpanStatusCode.ERROR })
+        return result
+      } finally {
+        const attributes = { channel, outcome }
+        pushNotificationCounter.add(1, attributes)
+        pushNotificationDuration.record(elapsedSeconds(startedAt), attributes)
+      }
+    }
+  )
+}
 
 export async function sendNotification(agentContext: AgentContext, connectionId: string) {
   if (!config.pushNotifications) return
@@ -16,11 +57,17 @@ export async function sendNotification(agentContext: AgentContext, connectionId:
   if (config.pushNotifications.webhookUrl) {
     // Emit a webhook notification, which can send a notification based on the
     // connectionId or optionally the device token.
-    await sendWebhookNotification(
-      agentContext,
-      config.pushNotifications.webhookUrl,
+    await instrumentPush(
+      'webhook',
       connectionId,
-      pushNotificationFcmRecord?.deviceToken
+      () =>
+        sendWebhookNotification(
+          agentContext,
+          config.pushNotifications.webhookUrl as string,
+          connectionId,
+          pushNotificationFcmRecord?.deviceToken
+        ),
+      (sent) => sent
     )
   }
 
@@ -34,7 +81,12 @@ export async function sendNotification(agentContext: AgentContext, connectionId:
 
     // Check for firebase configuration
     // Send a Firebase Cloud Message notification to the device found for a given connection
-    await sendFcmPushNotification(agentContext, pushNotificationFcmRecord)
+    await instrumentPush(
+      'fcm',
+      connectionId,
+      () => sendFcmPushNotification(agentContext, pushNotificationFcmRecord),
+      (response) => response !== undefined
+    )
   }
 }
 
@@ -63,16 +115,17 @@ async function sendWebhookNotification(
 
     if (response.ok) {
       agentContext.config.logger.info('Notification sent successfully')
+      return true
     } else {
       agentContext.config.logger.error('Error sending notification', {
         cause: response.statusText,
       })
+      return false
     }
-
-    agentContext.config.logger.info(`Notification sent successfully to ${connectionId}`)
   } catch (error) {
     agentContext.config.logger.error('Error sending notification', {
       cause: error,
     })
+    return false
   }
 }

@@ -15,20 +15,13 @@ export function loadStorage(): { drizzle?: DrizzleStorageModule } {
 
     let database: ReturnType<typeof drizzlePostgres> | ReturnType<typeof drizzleSqlite>
     if (storage.dialect === 'postgres') {
-      if (config.instrumentationEnabled) {
-        // Construct the pg Pool explicitly (behaviourally identical to letting
-        // drizzle create it from the URL) so the debug gauge can read live pool
-        // stats — the direct diagnostic for connection-pool saturation under load.
-        const pool = new Pool({ connectionString: storage.databaseUrl })
-        registerDbPoolAccessor(() => ({
-          total: pool.totalCount,
-          idle: pool.idleCount,
-          waiting: pool.waitingCount,
-        }))
-        database = drizzlePostgres(pool)
-      } else {
-        database = drizzlePostgres(storage.databaseUrl)
-      }
+      const pool = new Pool({ connectionString: storage.databaseUrl })
+      registerDbPoolAccessor('drizzle', () => ({
+        total: pool.totalCount,
+        idle: pool.idleCount,
+        waiting: pool.waitingCount,
+      }))
+      database = drizzlePostgres(pool)
     } else {
       database = drizzleSqlite(storage.databaseUrl)
     }

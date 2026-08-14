@@ -1,5 +1,4 @@
 import type { Agent, AgentContext } from '@credo-ts/core'
-import { LogLevel } from '@credo-ts/core'
 import type {
   AddMessageOptions,
   GetAvailableMessageCountOptions,
@@ -9,119 +8,118 @@ import type {
 } from '@credo-ts/didcomm'
 
 import type { ExtendedQueueTransportRepository } from '../config/messagePickupLoader.js'
-import { durationMs, emitStructured, makeSpanId, monoNow, tryExtractJweFp } from '../logger/StructuredLogger.js'
-import { recordQueueWrite } from './metrics.js'
+import {
+  elapsedSeconds,
+  getJweFingerprint,
+  hashIdentifier,
+  queueBatchSize,
+  queueMessageAge,
+  queueOperationCounter,
+  queueOperationDuration,
+  SpanKind,
+  withSpan,
+} from '../telemetry/api.js'
 
-// Wraps ANY DidCommQueueTransportRepository (the in-tree `credo` queue, or the
-// `postgres` / `dynamodb` backends) and emits the queue-side instrumentation
-// hops. Decorating the repository here — rather than editing each backend —
-// means every pickup-storage type is covered uniformly, and the external
-// backend packages stay untouched (umbrella convention: instrument in the
-// consuming repo, not in `@credo-ts/*`).
+type QueueOperation = 'enqueue' | 'receive' | 'settle' | 'count'
+
 export class InstrumentedQueueTransportRepository implements ExtendedQueueTransportRepository {
-  public constructor(private readonly inner: ExtendedQueueTransportRepository) {}
+  public constructor(
+    private readonly inner: ExtendedQueueTransportRepository,
+    private readonly backend: 'credo' | 'postgres' | 'dynamodb'
+  ) {}
 
   public initialize(agent: Agent): Promise<void> {
     return this.inner.initialize?.(agent) ?? Promise.resolve()
   }
 
+  public getPoolStats() {
+    return this.inner.getPoolStats?.() ?? null
+  }
+
+  public shutdown(agentContext: AgentContext): Promise<void> {
+    return this.inner.shutdown?.(agentContext) ?? Promise.resolve()
+  }
+
+  private async instrument<T>(
+    operation: QueueOperation,
+    connectionId: string,
+    kind: SpanKind,
+    callback: () => T | Promise<T>,
+    attributes: Record<string, string | number | boolean | undefined> = {}
+  ): Promise<T> {
+    const startedAt = process.hrtime.bigint()
+    return withSpan(
+      `${operation} didcomm.pickup.queue`,
+      {
+        kind,
+        attributes: {
+          'messaging.system': 'didcomm',
+          'messaging.destination.name': 'pickup.queue',
+          'messaging.operation.name': operation,
+          'messaging.operation.type': operation === 'enqueue' ? 'send' : operation === 'receive' ? 'receive' : 'settle',
+          'didcomm.queue.backend': this.backend,
+          'didcomm.connection.id_hash': hashIdentifier(connectionId),
+          ...attributes,
+        },
+      },
+      async () => {
+        let outcome = 'ok'
+        try {
+          return await callback()
+        } catch (error) {
+          outcome = 'error'
+          throw error
+        } finally {
+          const metricAttributes = { backend: this.backend, operation, outcome }
+          queueOperationCounter.add(1, metricAttributes)
+          queueOperationDuration.record(elapsedSeconds(startedAt), metricAttributes)
+        }
+      }
+    )
+  }
+
   public getAvailableMessageCount(
     agentContext: AgentContext,
     options: GetAvailableMessageCountOptions
-  ): number | Promise<number> {
-    return this.inner.getAvailableMessageCount(agentContext, options)
+  ): Promise<number> {
+    return this.instrument('count', options.connectionId, SpanKind.INTERNAL, () =>
+      this.inner.getAvailableMessageCount(agentContext, options)
+    )
   }
 
-  public removeMessages(agentContext: AgentContext, options: RemoveMessagesOptions): void | Promise<void> {
-    return this.inner.removeMessages(agentContext, options)
+  public removeMessages(agentContext: AgentContext, options: RemoveMessagesOptions): Promise<void> {
+    return this.instrument('settle', options.connectionId, SpanKind.CLIENT, () =>
+      this.inner.removeMessages(agentContext, options)
+    )
   }
 
-  public async takeFromQueue(
-    agentContext: AgentContext,
-    options: TakeFromQueueOptions
-  ): Promise<QueuedDidCommMessage[]> {
-    const { connectionId, limit } = options
-    const spanId = makeSpanId()
-    const startMono = monoNow()
-
-    emitStructured(LogLevel.info, {
-      hop: 'mediator.pickup.batch.dispatch.start',
-      flow: 'pickup',
-      span_id: spanId,
-      conn_id: connectionId,
-      pickup_limit: limit,
-    })
-
-    const messages = await this.inner.takeFromQueue(agentContext, options)
-
-    // Per-message inner-JWE fingerprints, so the analyst can join a dispatch
-    // event back to the queue write that produced each message.
-    const dispatchedFingerprints = messages.map((m) => tryExtractJweFp(m.encryptedMessage)).filter(Boolean)
-
-    emitStructured(LogLevel.info, {
-      hop: 'mediator.pickup.batch.dispatch.end',
-      flow: 'pickup',
-      span_id: spanId,
-      conn_id: connectionId,
-      duration_ms: durationMs(startMono),
-      message_count: messages.length,
-      delete_messages: options.deleteMessages ?? false,
-      dispatched_jwe_fps: dispatchedFingerprints,
-    })
-
-    return messages
+  public takeFromQueue(agentContext: AgentContext, options: TakeFromQueueOptions): Promise<QueuedDidCommMessage[]> {
+    return this.instrument(
+      'receive',
+      options.connectionId,
+      SpanKind.CONSUMER,
+      async () => {
+        const messages = await this.inner.takeFromQueue(agentContext, options)
+        queueBatchSize.record(messages.length, { backend: this.backend })
+        const now = Date.now()
+        for (const message of messages) {
+          if (message.receivedAt) {
+            queueMessageAge.record(Math.max(0, now - message.receivedAt.getTime()) / 1000, { backend: this.backend })
+          }
+        }
+        return messages
+      },
+      { 'messaging.batch.message_count': options.limit }
+    )
   }
 
-  public async addMessage(agentContext: AgentContext, options: AddMessageOptions): Promise<string> {
-    const { connectionId, payload } = options
-
-    // jwe_fp_out: inner JWE fingerprint — the payload being queued, which the
-    // mobile wallet will unpack. Joins to the recipient's inbound and, via the
-    // mediator.forward.bridge line, back to the outer iv the sender transport saw.
-    const jweFpOut = tryExtractJweFp(payload)
-
-    emitStructured(LogLevel.info, {
-      hop: 'mediator.forward.strategy.decision',
-      conn_id: connectionId,
-      jwe_fp_out: jweFpOut,
-      decision: 'queue',
-    })
-
-    const spanId = makeSpanId()
-    const startMono = monoNow()
-    emitStructured(LogLevel.info, {
-      hop: 'mediator.queue.write.start',
-      span_id: spanId,
-      conn_id: connectionId,
-      jwe_fp_out: jweFpOut,
-    })
-
-    const id = await this.inner.addMessage(agentContext, options)
-
-    recordQueueWrite()
-    emitStructured(LogLevel.info, {
-      hop: 'mediator.queue.write.end',
-      span_id: spanId,
-      conn_id: connectionId,
-      jwe_fp_out: jweFpOut,
-      duration_ms: durationMs(startMono),
-    })
-
-    // Per-connection queue depth after the write — fire-and-forget so the
-    // count never blocks the delivery path. Works for every backend (standard
-    // repository method), unlike the aggregate gauge.
-    void Promise.resolve(this.inner.getAvailableMessageCount(agentContext, { connectionId }))
-      .then((queueDepth) => {
-        emitStructured(LogLevel.info, {
-          hop: 'mediator.queue.depth.sample',
-          conn_id: connectionId,
-          queue_depth_after: queueDepth,
-        })
-      })
-      .catch(() => {
-        // best-effort
-      })
-
-    return id
+  public addMessage(agentContext: AgentContext, options: AddMessageOptions): Promise<string> {
+    return this.instrument(
+      'enqueue',
+      options.connectionId,
+      SpanKind.PRODUCER,
+      () => this.inner.addMessage(agentContext, options),
+      { 'didcomm.message.fingerprint': getJweFingerprint(options.payload) }
+    )
   }
 }
