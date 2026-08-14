@@ -20,6 +20,12 @@ const clientOptions = {
   credentials: { accessKeyId: 'local', secretAccessKey: 'local' },
 }
 
+const transactionCanceledError = (code?: string) => {
+  const error = new Error(code ?? 'transaction cancelled')
+  error.name = 'TransactionCanceledException'
+  return Object.assign(error, code === undefined ? {} : { CancellationReasons: [{ Code: code }] })
+}
+
 suite('dynamodb recipient index', () => {
   test('uses a strongly consistent read to establish the migration cutover', async () => {
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
@@ -304,7 +310,7 @@ suite('dynamodb recipient index', () => {
   })
 
   test('atomically writes a new canonical message and its recipient index entries', async () => {
-    const transactionError = new Error('transaction failed')
+    const transactionError = transactionCanceledError('ConditionalCheckFailed')
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
       if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
@@ -336,7 +342,11 @@ suite('dynamodb recipient index', () => {
       const metadataReads = commands.filter((command): command is GetItemCommand => command instanceof GetItemCommand)
       expect(metadataReads.every((command) => command.input.ConsistentRead === true)).toBe(true)
       expect(commands.some((command) => command instanceof UpdateItemCommand)).toBe(false)
-      const transaction = commands.find((command) => command instanceof TransactWriteItemsCommand)
+      const transactions = commands.filter(
+        (command): command is TransactWriteItemsCommand => command instanceof TransactWriteItemsCommand
+      )
+      expect(transactions).toHaveLength(1)
+      const transaction = transactions[0]
       const transactionInput = transaction instanceof TransactWriteItemsCommand ? transaction.input : undefined
       expect(transactionInput?.TransactItems).toHaveLength(3)
       expect(transactionInput?.TransactItems?.[0].Update?.TableName).toBe('queued_messages')
@@ -346,6 +356,48 @@ suite('dynamodb recipient index', () => {
         )
       ).toBe(true)
     } finally {
+      send.mockRestore()
+    }
+  })
+
+  test('retries a throttled atomic enqueue with a stable idempotency token', async () => {
+    const transactionTokens: Array<string | undefined> = []
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof GetItemCommand) {
+        return {
+          Item: {
+            connectionId: { S: connectionId },
+            recipientMessageId: { S: '__recipient_index_metadata__' },
+            cutoverMessageId: { N: '0' },
+          },
+        } as never
+      }
+      if (command instanceof TransactWriteItemsCommand) {
+        transactionTokens.push(command.input.ClientRequestToken)
+        if (transactionTokens.length === 1) throw transactionCanceledError('ProvisionedThroughputExceeded')
+        return {} as never
+      }
+      return {} as never
+    })
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      await expect(
+        client.addMessage({
+          connectionId,
+          recipientDids: [recipientDid],
+          encryptedMessage: { ciphertext: 'a', iv: 'b', protected: 'c', tag: 'd' },
+          receivedAt: new Date(1),
+        })
+      ).resolves.toBeDefined()
+
+      expect(transactionTokens).toHaveLength(2)
+      expect(transactionTokens[1]).toBe(transactionTokens[0])
+    } finally {
+      random.mockRestore()
       send.mockRestore()
     }
   })
@@ -409,6 +461,97 @@ suite('dynamodb recipient index', () => {
       ).toBe(true)
       expect(metadataRead instanceof GetItemCommand ? metadataRead.input.ConsistentRead : undefined).toBe(true)
     } finally {
+      send.mockRestore()
+    }
+  })
+
+  test('retries a reasonless transaction cancellation during atomic deletion', async () => {
+    const messageId = '1234567890123001'
+    const transactionTokens: Array<string | undefined> = []
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof BatchGetItemCommand) {
+        return {
+          Responses: {
+            queued_messages: [
+              {
+                connectionId: { S: connectionId },
+                messageId: { N: messageId },
+                recipientDids: { L: [{ S: recipientDid }] },
+                receivedAt: { N: '0' },
+              },
+            ],
+          },
+        } as never
+      }
+      if (command instanceof GetItemCommand) {
+        return {
+          Item: {
+            connectionId: { S: connectionId },
+            recipientMessageId: { S: '__recipient_index_metadata__' },
+            cutoverMessageId: { N: '0' },
+          },
+        } as never
+      }
+      if (command instanceof TransactWriteItemsCommand) {
+        transactionTokens.push(command.input.ClientRequestToken)
+        if (transactionTokens.length === 1) throw transactionCanceledError()
+        return {} as never
+      }
+      return {} as never
+    })
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      await expect(client.removeMessages({ connectionId, messageIds: [messageId] })).resolves.toBeUndefined()
+      expect(transactionTokens).toHaveLength(2)
+      expect(transactionTokens[1]).toBe(transactionTokens[0])
+    } finally {
+      random.mockRestore()
+      send.mockRestore()
+    }
+  })
+
+  test('fails after the capped number of retryable transaction cancellations', async () => {
+    let transactionCount = 0
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof TransactWriteItemsCommand) {
+        transactionCount += 1
+        throw transactionCanceledError('TransactionConflict')
+      }
+      return {} as never
+    })
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
+    vi.useFakeTimers()
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      const transactWriteItemsWithRetry = client as unknown as {
+        transactWriteItemsWithRetry: (input: TransactWriteItemsCommand['input']) => Promise<void>
+      }
+      const transaction = transactWriteItemsWithRetry.transactWriteItemsWithRetry({
+        ClientRequestToken: 'retry-cap-test',
+        TransactItems: [
+          {
+            Delete: {
+              TableName: 'queued_messages',
+              Key: { connectionId: { S: connectionId }, messageId: { N: '1' } },
+            },
+          },
+        ],
+      })
+      const expectedFailure = expect(transaction).rejects.toThrow('TransactWriteItems exceeded 8 retries')
+      await vi.runAllTimersAsync()
+
+      await expectedFailure
+      expect(transactionCount).toBe(9)
+    } finally {
+      vi.useRealTimers()
+      random.mockRestore()
       send.mockRestore()
     }
   })

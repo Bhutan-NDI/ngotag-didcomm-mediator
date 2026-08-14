@@ -13,6 +13,7 @@ import {
   QueryCommandInput,
   type TransactWriteItem,
   TransactWriteItemsCommand,
+  type TransactWriteItemsCommandInput,
   UpdateItemCommand,
 } from '@aws-sdk/client-dynamodb'
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb'
@@ -51,9 +52,19 @@ type RecipientIndexEntry = { messageId: string }
 
 const RECIPIENT_INDEX_METADATA_KEY = '__recipient_index_metadata__'
 const RECIPIENT_INDEX_PREFIX = 'r#'
-const MAX_UNPROCESSED_ITEM_RETRIES = 8
-const INITIAL_UNPROCESSED_ITEM_RETRY_DELAY_MS = 50
-const MAX_UNPROCESSED_ITEM_RETRY_DELAY_MS = 2_000
+const MAX_OPERATION_RETRIES = 8
+const INITIAL_RETRY_DELAY_MS = 50
+const MAX_RETRY_DELAY_MS = 2_000
+const RETRYABLE_TRANSACTION_CANCELLATION_CODES = new Set([
+  'ProvisionedThroughputExceeded',
+  'ThrottlingError',
+  'TransactionConflict',
+])
+const NON_RETRYABLE_TRANSACTION_CANCELLATION_CODES = new Set([
+  'ConditionalCheckFailed',
+  'ItemCollectionSizeLimitExceeded',
+  'ValidationError',
+])
 
 export class DynamoDbClientRepository {
   private dynamodbClient: DynamoDBClient
@@ -539,7 +550,7 @@ export class DynamoDbClientRepository {
       messages.push(...this.toQueuedMessages(response.Responses?.[this.tableName]))
       const unprocessedKeys = response.UnprocessedKeys?.[this.tableName]?.Keys
       if (!unprocessedKeys || unprocessedKeys.length === 0) return messages
-      await this.waitForUnprocessedItems('BatchGetItem', retryAttempt++)
+      await this.waitBeforeRetry('BatchGetItem', retryAttempt++)
       requestItems = {
         [this.tableName]: { Keys: unprocessedKeys, ConsistentRead: consistentRead || undefined },
       }
@@ -576,27 +587,25 @@ export class DynamoDbClientRepository {
       // Commit the canonical item and all recipient pointers atomically. A
       // failed index write can therefore never leave a durable message that is
       // newer than the cutover but invisible to recipient-scoped reads.
-      await this.dynamodbClient.send(
-        new TransactWriteItemsCommand({
-          ClientRequestToken: createHash('sha256')
-            .update(`${options.connectionId}:${messageId}`)
-            .digest('hex')
-            .slice(0, 36),
-          TransactItems: [
-            { Update: messageUpdate },
-            ...recipientDids.map((recipientDid) => ({
-              Put: {
-                TableName: this.recipientIndexTableName,
-                Item: marshall({
-                  connectionId: options.connectionId,
-                  recipientMessageId: this.recipientIndexSortKey(recipientDid, messageId),
-                  messageId: Number(messageId),
-                }),
-              },
-            })),
-          ],
-        })
-      )
+      await this.transactWriteItemsWithRetry({
+        ClientRequestToken: createHash('sha256')
+          .update(`${options.connectionId}:${messageId}`)
+          .digest('hex')
+          .slice(0, 36),
+        TransactItems: [
+          { Update: messageUpdate },
+          ...recipientDids.map((recipientDid) => ({
+            Put: {
+              TableName: this.recipientIndexTableName,
+              Item: marshall({
+                connectionId: options.connectionId,
+                recipientMessageId: this.recipientIndexSortKey(recipientDid, messageId),
+                messageId: Number(messageId),
+              }),
+            },
+          })),
+        ],
+      })
     } else {
       await this.dynamodbClient.send(new UpdateItemCommand(messageUpdate))
     }
@@ -656,33 +665,81 @@ export class DynamoDbClientRepository {
     // visible. Independent chunks are all attempted before an error propagates.
     const results = await Promise.allSettled(
       transactionBatches.map((transactItems) =>
-        this.dynamodbClient.send(
-          new TransactWriteItemsCommand({
-            ClientRequestToken: createHash('sha256')
-              .update(`remove:${JSON.stringify(transactItems)}`)
-              .digest('hex')
-              .slice(0, 36),
-            TransactItems: transactItems,
-          })
-        )
+        this.transactWriteItemsWithRetry({
+          ClientRequestToken: createHash('sha256')
+            .update(`remove:${JSON.stringify(transactItems)}`)
+            .digest('hex')
+            .slice(0, 36),
+          TransactItems: transactItems,
+        })
       )
     )
     const failedResult = results.find((result) => result.status === 'rejected')
     if (failedResult) throw failedResult.reason
   }
 
-  private async waitForUnprocessedItems(operation: string, retryAttempt: number): Promise<void> {
-    if (retryAttempt >= MAX_UNPROCESSED_ITEM_RETRIES) {
-      this.logger.error(`${operation} still has unprocessed items after retries`, {
+  private async transactWriteItemsWithRetry(input: TransactWriteItemsCommandInput): Promise<void> {
+    let retryAttempt = 0
+    while (true) {
+      try {
+        await this.dynamodbClient.send(new TransactWriteItemsCommand(input))
+        return
+      } catch (error) {
+        if (!this.isRetryableTransactionError(error)) throw error
+        await this.waitBeforeRetry('TransactWriteItems', retryAttempt++, error)
+      }
+    }
+  }
+
+  private isRetryableTransactionError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false
+    if (
+      error.name === 'ProvisionedThroughputExceededException' ||
+      error.name === 'ThrottlingException' ||
+      error.name === 'RequestLimitExceeded' ||
+      error.name === 'TransactionConflictException' ||
+      error.name === 'TransactionInProgressException' ||
+      error.name === 'InternalServerError'
+    ) {
+      return true
+    }
+    if (error.name !== 'TransactionCanceledException') return false
+
+    const cancellationReasons = (error as Error & { CancellationReasons?: Array<{ Code?: string }> })
+      .CancellationReasons
+    const reasonCodes = (cancellationReasons ?? [])
+      .map((reason) => reason.Code)
+      .filter((code): code is string => code !== undefined && code !== 'None')
+
+    // AWS documents that cancellation reasons may be absent outside Java. Use
+    // codes when available (or embedded in the message), but treat a reasonless
+    // cancellation as transient for these bounded, idempotent transactions.
+    const reportedCodes =
+      reasonCodes.length > 0
+        ? reasonCodes
+        : [...RETRYABLE_TRANSACTION_CANCELLATION_CODES, ...NON_RETRYABLE_TRANSACTION_CANCELLATION_CODES].filter(
+            (code) => error.message.includes(code)
+          )
+    if (reportedCodes.some((code) => NON_RETRYABLE_TRANSACTION_CANCELLATION_CODES.has(code))) return false
+    return (
+      reportedCodes.length === 0 || reportedCodes.every((code) => RETRYABLE_TRANSACTION_CANCELLATION_CODES.has(code))
+    )
+  }
+
+  private async waitBeforeRetry(operation: string, retryAttempt: number, cause?: unknown): Promise<void> {
+    if (retryAttempt >= MAX_OPERATION_RETRIES) {
+      this.logger.error(`${operation} still failed after retries`, {
         retryAttempts: retryAttempt + 1,
+        error: cause,
       })
-      throw new Error(`${operation} exceeded ${MAX_UNPROCESSED_ITEM_RETRIES} retries for unprocessed items`)
+      const retryError = new Error(`${operation} exceeded ${MAX_OPERATION_RETRIES} retries`) as Error & {
+        cause?: unknown
+      }
+      retryError.cause = cause
+      throw retryError
     }
 
-    const exponentialDelay = Math.min(
-      INITIAL_UNPROCESSED_ITEM_RETRY_DELAY_MS * 2 ** retryAttempt,
-      MAX_UNPROCESSED_ITEM_RETRY_DELAY_MS
-    )
+    const exponentialDelay = Math.min(INITIAL_RETRY_DELAY_MS * 2 ** retryAttempt, MAX_RETRY_DELAY_MS)
     // Equal jitter provides a growing delay while avoiding synchronized retry
     // storms from mediators that were throttled at the same time.
     const delayMs = Math.floor(exponentialDelay / 2 + Math.random() * (exponentialDelay / 2))
