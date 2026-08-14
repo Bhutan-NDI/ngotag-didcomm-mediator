@@ -1,6 +1,5 @@
 import {
   BatchGetItemCommand,
-  BatchWriteItemCommand,
   CreateTableCommand,
   DescribeTableCommand,
   DynamoDBClient,
@@ -248,6 +247,18 @@ suite('dynamodb recipient index', () => {
         )
       const recipientQueryInput = recipientQuery instanceof QueryCommand ? recipientQuery.input : undefined
       expect(recipientQueryInput?.FilterExpression).toBeUndefined()
+      const metadataRead = send.mock.calls
+        .map(([command]) => command as unknown)
+        .find((command) => command instanceof GetItemCommand)
+      const canonicalRead = send.mock.calls
+        .map(([command]) => command as unknown)
+        .find((command) => command instanceof BatchGetItemCommand)
+      expect(metadataRead instanceof GetItemCommand ? metadataRead.input.ConsistentRead : undefined).toBeUndefined()
+      expect(
+        canonicalRead instanceof BatchGetItemCommand
+          ? canonicalRead.input.RequestItems?.queued_messages?.ConsistentRead
+          : undefined
+      ).toBeUndefined()
     } finally {
       send.mockRestore()
     }
@@ -274,10 +285,10 @@ suite('dynamodb recipient index', () => {
     try {
       const client = await DynamoDbClientRepository.initialize(clientOptions)
       const batchGetMessages = client as unknown as {
-        batchGetMessages: (connection: string, messageIds: string[]) => Promise<unknown[]>
+        batchGetMessages: (connection: string, messageIds: string[], consistentRead: boolean) => Promise<unknown[]>
       }
 
-      await batchGetMessages.batchGetMessages(connectionId, ['1234567890123001'])
+      await batchGetMessages.batchGetMessages(connectionId, ['1234567890123001'], true)
 
       const batchGetCommands = send.mock.calls
         .map(([command]) => command as unknown)
@@ -322,6 +333,8 @@ suite('dynamodb recipient index', () => {
       ).rejects.toThrow(transactionError)
 
       const commands = send.mock.calls.map(([command]) => command as unknown)
+      const metadataReads = commands.filter((command): command is GetItemCommand => command instanceof GetItemCommand)
+      expect(metadataReads.every((command) => command.input.ConsistentRead === true)).toBe(true)
       expect(commands.some((command) => command instanceof UpdateItemCommand)).toBe(false)
       const transaction = commands.find((command) => command instanceof TransactWriteItemsCommand)
       const transactionInput = transaction instanceof TransactWriteItemsCommand ? transaction.input : undefined
@@ -337,45 +350,77 @@ suite('dynamodb recipient index', () => {
     }
   })
 
-  test('retries unprocessed batch writes with backoff', async () => {
-    let batchWriteCount = 0
+  test('atomically deletes each message with its pointers and attempts every transaction batch', async () => {
+    const messages = Array.from({ length: 51 }, (_, index) => ({
+      connectionId: { S: connectionId },
+      messageId: { N: String(index + 1) },
+      recipientDids: { L: [{ S: recipientDid }] },
+      receivedAt: { N: String(index) },
+    }))
+    const transactionInputs: TransactWriteItemsCommand['input'][] = []
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
       if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
-      if (command instanceof BatchWriteItemCommand) {
-        batchWriteCount += 1
-        return batchWriteCount === 1 ? { UnprocessedItems: command.input.RequestItems } : ({} as never)
+      if (command instanceof BatchGetItemCommand) {
+        return { Responses: { queued_messages: messages } } as never
+      }
+      if (command instanceof GetItemCommand) {
+        return {
+          Item: {
+            connectionId: { S: connectionId },
+            recipientMessageId: { S: '__recipient_index_metadata__' },
+            cutoverMessageId: { N: '0' },
+          },
+        } as never
+      }
+      if (command instanceof TransactWriteItemsCommand) {
+        transactionInputs.push(command.input)
+        if (command.input.TransactItems?.length === 100) throw new Error('first transaction failed')
+        return {} as never
       }
       return {} as never
     })
-    const random = vi.spyOn(Math, 'random').mockReturnValue(0)
 
     try {
       const client = await DynamoDbClientRepository.initialize(clientOptions)
-      const batchWriteItems = client as unknown as {
-        batchWriteItems: (requests: Record<string, Array<Record<string, unknown>>>) => Promise<void>
+      await expect(
+        client.removeMessages({ connectionId, messageIds: messages.map((message) => message.messageId.N) })
+      ).rejects.toThrow('first transaction failed')
+
+      expect(transactionInputs.map((input) => input.TransactItems?.length)).toEqual([100, 2])
+      for (const input of transactionInputs) {
+        const tables = input.TransactItems?.map((item) => item.Delete?.TableName)
+        expect(tables?.filter((table) => table === 'queued_messages')).toHaveLength((tables?.length ?? 0) / 2)
+        expect(tables?.filter((table) => table === 'queued_messages_recipient_index')).toHaveLength(
+          (tables?.length ?? 0) / 2
+        )
       }
 
-      await expect(
-        batchWriteItems.batchWriteItems({
-          queued_messages: [{ PutRequest: { Item: { connectionId: { S: connectionId } } } }],
-        })
-      ).resolves.toBeUndefined()
-      expect(batchWriteCount).toBe(2)
+      const batchGet = send.mock.calls
+        .map(([command]) => command as unknown)
+        .find((command) => command instanceof BatchGetItemCommand)
+      const metadataRead = send.mock.calls
+        .map(([command]) => command as unknown)
+        .find((command) => command instanceof GetItemCommand)
+      expect(
+        batchGet instanceof BatchGetItemCommand
+          ? batchGet.input.RequestItems?.queued_messages?.ConsistentRead
+          : undefined
+      ).toBe(true)
+      expect(metadataRead instanceof GetItemCommand ? metadataRead.input.ConsistentRead : undefined).toBe(true)
     } finally {
-      random.mockRestore()
       send.mockRestore()
     }
   })
 
-  test('fails after the capped number of unprocessed batch-write retries', async () => {
-    let batchWriteCount = 0
+  test('fails after the capped number of unprocessed batch-get retries', async () => {
+    let batchGetCount = 0
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
       if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
-      if (command instanceof BatchWriteItemCommand) {
-        batchWriteCount += 1
-        return { UnprocessedItems: command.input.RequestItems } as never
+      if (command instanceof BatchGetItemCommand) {
+        batchGetCount += 1
+        return { UnprocessedKeys: command.input.RequestItems } as never
       }
       return {} as never
     })
@@ -384,18 +429,16 @@ suite('dynamodb recipient index', () => {
 
     try {
       const client = await DynamoDbClientRepository.initialize(clientOptions)
-      const batchWriteItems = client as unknown as {
-        batchWriteItems: (requests: Record<string, Array<Record<string, unknown>>>) => Promise<void>
+      const batchGetMessages = client as unknown as {
+        batchGetMessages: (connection: string, messageIds: string[], consistentRead: boolean) => Promise<unknown[]>
       }
 
-      const batchWrite = batchWriteItems.batchWriteItems({
-        queued_messages: [{ PutRequest: { Item: { connectionId: { S: connectionId } } } }],
-      })
-      const expectedFailure = expect(batchWrite).rejects.toThrow('BatchWriteItem exceeded 8 retries')
+      const batchGet = batchGetMessages.batchGetMessages(connectionId, ['1'], false)
+      const expectedFailure = expect(batchGet).rejects.toThrow('BatchGetItem exceeded 8 retries')
       await vi.runAllTimersAsync()
 
       await expectedFailure
-      expect(batchWriteCount).toBe(9)
+      expect(batchGetCount).toBe(9)
     } finally {
       vi.useRealTimers()
       random.mockRestore()
@@ -403,31 +446,35 @@ suite('dynamodb recipient index', () => {
     }
   })
 
-  test('attempts every batch-write chunk even when one chunk fails', async () => {
+  test('starts every batch-get chunk before waiting for a slow chunk', async () => {
+    let resolveFirstChunk: ((value: { Responses: { queued_messages: never[] } }) => void) | undefined
+    const firstChunk = new Promise<{ Responses: { queued_messages: never[] } }>((resolve) => {
+      resolveFirstChunk = resolve
+    })
     const batchSizes: number[] = []
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
       if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
-      if (command instanceof BatchWriteItemCommand) {
-        const size = command.input.RequestItems?.queued_messages?.length ?? 0
+      if (command instanceof BatchGetItemCommand) {
+        const size = command.input.RequestItems?.queued_messages?.Keys?.length ?? 0
         batchSizes.push(size)
-        if (size === 25) throw new Error('first chunk failed')
-        return {} as never
+        if (size === 100) return firstChunk as never
+        return { Responses: { queued_messages: [] } } as never
       }
       return {} as never
     })
 
     try {
       const client = await DynamoDbClientRepository.initialize(clientOptions)
-      const batchWrite = client as unknown as {
-        batchWrite: (requests: Array<Record<string, unknown>>, tableName: string) => Promise<void>
+      const batchGetMessages = client as unknown as {
+        batchGetMessages: (connection: string, messageIds: string[], consistentRead: boolean) => Promise<unknown[]>
       }
-      const requests = Array.from({ length: 26 }, (_, index) => ({
-        DeleteRequest: { Key: { messageId: { N: String(index) } } },
-      }))
+      const messageIds = Array.from({ length: 101 }, (_, index) => String(index + 1))
 
-      await expect(batchWrite.batchWrite(requests, 'queued_messages')).rejects.toThrow('first chunk failed')
-      expect(batchSizes).toEqual([25, 1])
+      const batchGet = batchGetMessages.batchGetMessages(connectionId, messageIds, false)
+      expect(batchSizes).toEqual([100, 1])
+      resolveFirstChunk?.({ Responses: { queued_messages: [] } })
+      await expect(batchGet).resolves.toEqual([])
     } finally {
       send.mockRestore()
     }

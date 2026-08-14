@@ -1,7 +1,6 @@
 import { createHash, randomInt } from 'node:crypto'
 import {
   BatchGetItemCommand,
-  BatchWriteItemCommand,
   CreateTableCommand,
   CreateTableCommandInput,
   DescribeTableCommand,
@@ -12,6 +11,7 @@ import {
   PutItemCommand,
   QueryCommand,
   QueryCommandInput,
+  type TransactWriteItem,
   TransactWriteItemsCommand,
   UpdateItemCommand,
 } from '@aws-sdk/client-dynamodb'
@@ -185,12 +185,15 @@ export class DynamoDbClientRepository {
   // after this release records the greatest existing message id for its
   // connection. Older messages are read through the legacy path until drained;
   // newer messages use the recipient index immediately.
-  private async getRecipientIndexMetadata(connectionId: string): Promise<RecipientIndexMetadata | undefined> {
+  private async getRecipientIndexMetadata(
+    connectionId: string,
+    consistentRead = false
+  ): Promise<RecipientIndexMetadata | undefined> {
     const response = await this.dynamodbClient.send(
       new GetItemCommand({
         TableName: this.recipientIndexTableName,
         Key: marshall({ connectionId, recipientMessageId: RECIPIENT_INDEX_METADATA_KEY }),
-        ConsistentRead: true,
+        ConsistentRead: consistentRead || undefined,
       })
     )
     if (!response.Item) return undefined
@@ -198,7 +201,10 @@ export class DynamoDbClientRepository {
   }
 
   private async prepareRecipientIndex(connectionId: string): Promise<RecipientIndexMetadata> {
-    const existing = await this.getRecipientIndexMetadata(connectionId)
+    // The write path must observe an existing cutover marker immediately. Read
+    // paths can use the eventually consistent default because a transient miss
+    // safely falls back to the legacy query.
+    const existing = await this.getRecipientIndexMetadata(connectionId, true)
     if (existing) return existing
 
     const latestMessageId = await this.getLatestMessageId(connectionId)
@@ -214,7 +220,7 @@ export class DynamoDbClientRepository {
       return metadata
     } catch (error) {
       if (!(error instanceof Error) || error.name !== 'ConditionalCheckFailedException') throw error
-      const concurrentMetadata = await this.getRecipientIndexMetadata(connectionId)
+      const concurrentMetadata = await this.getRecipientIndexMetadata(connectionId, true)
       if (!concurrentMetadata) throw error
       return concurrentMetadata
     }
@@ -497,24 +503,43 @@ export class DynamoDbClientRepository {
     })
   }
 
-  private async batchGetMessages(connectionId: string, messageIds: string[]): Promise<QueuedMessage[]> {
-    const messages: QueuedMessage[] = []
+  private async batchGetMessages(
+    connectionId: string,
+    messageIds: string[],
+    consistentRead = false
+  ): Promise<QueuedMessage[]> {
+    const batches: Array<Promise<QueuedMessage[]>> = []
     for (let index = 0; index < messageIds.length; index += 100) {
-      const keys = messageIds
-        .slice(index, index + 100)
-        .map((messageId) => marshall({ connectionId, messageId: Number(messageId) }))
-      let requestItems = { [this.tableName]: { Keys: keys, ConsistentRead: true } }
-      let retryAttempt = 0
-      while (true) {
-        const response = await this.dynamodbClient.send(new BatchGetItemCommand({ RequestItems: requestItems }))
-        messages.push(...this.toQueuedMessages(response.Responses?.[this.tableName]))
-        const unprocessedKeys = response.UnprocessedKeys?.[this.tableName]?.Keys
-        if (!unprocessedKeys || unprocessedKeys.length === 0) break
-        await this.waitForUnprocessedItems('BatchGetItem', retryAttempt++)
-        requestItems = { [this.tableName]: { Keys: unprocessedKeys, ConsistentRead: true } }
+      batches.push(this.batchGetMessageChunk(connectionId, messageIds.slice(index, index + 100), consistentRead))
+    }
+
+    // Start every chunk before waiting so a throttled chunk cannot serialize
+    // unrelated reads. Await all of them before propagating the first failure.
+    const results = await Promise.allSettled(batches)
+    const failedResult = results.find((result) => result.status === 'rejected')
+    if (failedResult) throw failedResult.reason
+    return results.flatMap((result) => (result.status === 'fulfilled' ? result.value : []))
+  }
+
+  private async batchGetMessageChunk(
+    connectionId: string,
+    messageIds: string[],
+    consistentRead: boolean
+  ): Promise<QueuedMessage[]> {
+    const messages: QueuedMessage[] = []
+    const keys = messageIds.map((messageId) => marshall({ connectionId, messageId: Number(messageId) }))
+    let requestItems = { [this.tableName]: { Keys: keys, ConsistentRead: consistentRead || undefined } }
+    let retryAttempt = 0
+    while (true) {
+      const response = await this.dynamodbClient.send(new BatchGetItemCommand({ RequestItems: requestItems }))
+      messages.push(...this.toQueuedMessages(response.Responses?.[this.tableName]))
+      const unprocessedKeys = response.UnprocessedKeys?.[this.tableName]?.Keys
+      if (!unprocessedKeys || unprocessedKeys.length === 0) return messages
+      await this.waitForUnprocessedItems('BatchGetItem', retryAttempt++)
+      requestItems = {
+        [this.tableName]: { Keys: unprocessedKeys, ConsistentRead: consistentRead || undefined },
       }
     }
-    return messages
   }
 
   async addMessage(options: AddQueuedMessageOptions): Promise<string> {
@@ -576,52 +601,70 @@ export class DynamoDbClientRepository {
 
   async removeMessages(options: RemoveQueuedMessageOptions): Promise<void> {
     const messageIds = [...new Set(options.messageIds)]
-    const messages = await this.batchGetMessages(options.connectionId, messageIds)
+    if (messageIds.length === 0) return
 
-    // Delete recipient pointers first. If this phase partially fails, every
-    // canonical item remains available so a retry can reconstruct and reissue
-    // every pointer deletion. This avoids permanent orphan index entries.
-    await this.batchWrite(
-      messages.flatMap((message) =>
-        [...new Set(message.recipientDids)].map((recipientDid) => ({
-          DeleteRequest: {
-            Key: marshall({
-              connectionId: options.connectionId,
-              recipientMessageId: this.recipientIndexSortKey(recipientDid, message.id),
-            }),
+    // Removal needs current recipient DIDs and the immutable cutover boundary;
+    // both reads are correctness-sensitive, unlike ordinary count/pickup reads.
+    const [messages, metadata] = await Promise.all([
+      this.batchGetMessages(options.connectionId, messageIds, true),
+      this.getRecipientIndexMetadata(options.connectionId, true),
+    ])
+
+    const transactionBatches: TransactWriteItem[][] = []
+    let currentBatch: TransactWriteItem[] = []
+    for (const message of messages) {
+      const isIndexedMessage = metadata !== undefined && Number(message.id) > metadata.cutoverMessageId
+      const messageDeletes: TransactWriteItem[] = [
+        ...(isIndexedMessage
+          ? [...new Set(message.recipientDids)].map((recipientDid) => ({
+              Delete: {
+                TableName: this.recipientIndexTableName,
+                Key: marshall({
+                  connectionId: options.connectionId,
+                  recipientMessageId: this.recipientIndexSortKey(recipientDid, message.id),
+                }),
+              },
+            }))
+          : []),
+        {
+          Delete: {
+            TableName: this.tableName,
+            Key: marshall({ connectionId: options.connectionId, messageId: Number(message.id) }),
           },
-        }))
-      ),
-      this.recipientIndexTableName
-    )
+        },
+      ]
 
-    await this.batchWrite(
-      messageIds.map((messageId) => ({
-        DeleteRequest: { Key: marshall({ connectionId: options.connectionId, messageId: Number(messageId) }) },
-      })),
-      this.tableName
-    )
-  }
-
-  private async batchWrite(requests: Array<Record<string, unknown>>, tableName: string): Promise<void> {
-    const batches: Array<Promise<void>> = []
-    for (let index = 0; index < requests.length; index += 25) {
-      batches.push(this.batchWriteItems({ [tableName]: requests.slice(index, index + 25) }))
+      // New indexed messages are limited to 99 unique recipients at enqueue,
+      // leaving one transaction action for the canonical row.
+      if (messageDeletes.length > 100) {
+        throw new Error(`Queued message ${message.id} cannot be deleted atomically because it has too many recipients`)
+      }
+      if (currentBatch.length > 0 && currentBatch.length + messageDeletes.length > 100) {
+        transactionBatches.push(currentBatch)
+        currentBatch = []
+      }
+      currentBatch.push(...messageDeletes)
     }
-    const results = await Promise.allSettled(batches)
+    if (currentBatch.length > 0) transactionBatches.push(currentBatch)
+
+    // Each message's canonical row and all recipient pointers share a DynamoDB
+    // transaction, so a failed chunk leaves every message in that chunk fully
+    // visible. Independent chunks are all attempted before an error propagates.
+    const results = await Promise.allSettled(
+      transactionBatches.map((transactItems) =>
+        this.dynamodbClient.send(
+          new TransactWriteItemsCommand({
+            ClientRequestToken: createHash('sha256')
+              .update(`remove:${JSON.stringify(transactItems)}`)
+              .digest('hex')
+              .slice(0, 36),
+            TransactItems: transactItems,
+          })
+        )
+      )
+    )
     const failedResult = results.find((result) => result.status === 'rejected')
     if (failedResult) throw failedResult.reason
-  }
-
-  private async batchWriteItems(requestItems: Record<string, Array<Record<string, unknown>>>): Promise<void> {
-    let pending = requestItems
-    let retryAttempt = 0
-    while (Object.keys(pending).length > 0) {
-      const response = await this.dynamodbClient.send(new BatchWriteItemCommand({ RequestItems: pending as never }))
-      pending = (response.UnprocessedItems ?? {}) as Record<string, Array<Record<string, unknown>>>
-      if (Object.keys(pending).length === 0) return
-      await this.waitForUnprocessedItems('BatchWriteItem', retryAttempt++)
-    }
   }
 
   private async waitForUnprocessedItems(operation: string, retryAttempt: number): Promise<void> {
