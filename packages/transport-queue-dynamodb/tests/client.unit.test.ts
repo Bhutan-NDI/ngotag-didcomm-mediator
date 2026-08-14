@@ -258,7 +258,7 @@ suite('dynamodb recipient index', () => {
         canonicalRead instanceof BatchGetItemCommand
           ? canonicalRead.input.RequestItems?.queued_messages?.ConsistentRead
           : undefined
-      ).toBeUndefined()
+      ).toBe(true)
     } finally {
       send.mockRestore()
     }

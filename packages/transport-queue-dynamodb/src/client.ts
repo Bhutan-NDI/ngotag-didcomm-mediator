@@ -433,7 +433,11 @@ export class DynamoDbClientRepository {
     if (indexEntries.length === 0) return []
     const messages = await this.batchGetMessages(
       connectionId,
-      indexEntries.map((entry) => entry.messageId)
+      indexEntries.map((entry) => entry.messageId),
+      // The index and canonical tables replicate independently. Once an index
+      // pointer is visible, use a strong read so its payload cannot be missed
+      // transiently with no fallback and disagree with the indexed count.
+      true
     )
     const byId = new Map(messages.map((message) => [message.id, message]))
     return indexEntries.flatMap((entry) => {
