@@ -69,6 +69,10 @@ export class DidCommTransportQueueDynamoDb implements DidCommQueueTransportRepos
     })
   }
 
+  public async shutdown(): Promise<void> {
+    this.client.shutdown()
+  }
+
   private emitMessageQueuedEvent(agentContext: AgentContext, connectionId: string) {
     const eventEmitter = agentContext.resolve(EventEmitter)
 

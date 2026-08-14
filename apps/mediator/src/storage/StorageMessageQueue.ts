@@ -12,7 +12,7 @@ import { MessageRecord } from './MessageRecord.js'
 import { MessageRepository } from './MessageRepository.js'
 
 export class StorageServiceMessageQueue implements DidCommQueueTransportRepository {
-  // Aggregate queue-depth stats for the gauge snapshot (debug instrumentation).
+  // Aggregate queue-depth stats for OpenTelemetry observable gauges.
   public async getQueueStats(agentContext: AgentContext) {
     const messageRepository = agentContext.resolve(MessageRepository)
     return messageRepository.getQueueStats(agentContext)
@@ -63,9 +63,7 @@ export class StorageServiceMessageQueue implements DidCommQueueTransportReposito
   public async addMessage(agentContext: AgentContext, options: AddMessageOptions) {
     const { connectionId, payload } = options
 
-    agentContext.config.logger.debug(
-      `Adding message to queue for connection ${connectionId} with payload ${JSON.stringify(payload)}`
-    )
+    agentContext.config.logger.debug('Adding message to pickup queue')
 
     const messageRepository = agentContext.resolve(MessageRepository)
 

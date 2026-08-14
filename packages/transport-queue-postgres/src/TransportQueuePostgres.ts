@@ -55,6 +55,15 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
     )
   }
 
+  public getPoolStats(): { total: number; idle: number; waiting: number } | null {
+    if (!this.messagesCollection) return null
+    return {
+      total: this.messagesCollection.totalCount,
+      idle: this.messagesCollection.idleCount,
+      waiting: this.messagesCollection.waitingCount,
+    }
+  }
+
   /**
    * Initializes the service by setting up the database, message listeners, and the agent.
    * This method also configures the Pub/Sub system and registers event handlers.
@@ -377,7 +386,7 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
 
   public async shutdown(agentContext: AgentContext) {
     agentContext.config.logger.info('[shutdown] Close connection to postgres')
-    await this.messagesCollection?.end()
+    await Promise.all([this.messagesCollection?.end(), this.pubSubInstance.close()])
   }
 
   /**

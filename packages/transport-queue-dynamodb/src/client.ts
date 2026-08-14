@@ -80,6 +80,10 @@ export class DynamoDbClientRepository {
     return dcr
   }
 
+  public shutdown(): void {
+    this.dynamodbClient.destroy()
+  }
+
   private async validateTableKeySchema(): Promise<void> {
     const response = await this.dynamodbClient.send(
       new DescribeTableCommand({

@@ -13,6 +13,7 @@ ECR_REPO   ?= qa-services
 ECS_CLUSTER   ?= QA-NGOTAG-CLUSTER
 ECS_SERVICE   ?= animo-mediator
 ECS_TASK_DEF_FAMILY ?= QA-ANIMO-MEDIATOR-TDF
+ECS_CONTAINER_NAME ?= animo-mediator
 
 # Short git hash of HEAD (7 chars).
 GIT_HASH := $(shell git rev-parse --short=7 HEAD)
@@ -72,13 +73,15 @@ deploy-ecs:
 	aws ecs describe-task-definition $(AWS_PROFILE_FLAG) --region $(AWS_REGION) \
 		--task-definition $(ECS_TASK_DEF_FAMILY) \
 		--query 'taskDefinition' --output json \
-	| jq --arg img "$(REMOTE_IMAGE)" '\
+	| jq --arg img "$(REMOTE_IMAGE)" --arg container "$(ECS_CONTAINER_NAME)" '\
 		del(.taskDefinitionArn, .revision, .status, .requiresAttributes, \
 		    .compatibilities, .registeredAt, .registeredBy, .deregisteredAt) \
 		| .runtimePlatform = (.runtimePlatform // {}) \
 		| .runtimePlatform.cpuArchitecture = "ARM64" \
 		| .runtimePlatform.operatingSystemFamily = (.runtimePlatform.operatingSystemFamily // "LINUX") \
-		| .containerDefinitions[].image = $$img \
+		| if any(.containerDefinitions[]; .name == $$container) \
+		  then .containerDefinitions |= map(if .name == $$container then .image = $$img else . end) \
+		  else error("container not found: " + $$container) end \
 	' > $$tmp; \
 	echo ">> Registering new task definition (ARM64, image=$(REMOTE_IMAGE))..."; \
 	new_arn=$$(aws ecs register-task-definition $(AWS_PROFILE_FLAG) --region $(AWS_REGION) \

@@ -5,8 +5,9 @@ import {
   DidCommOutOfBandRole,
   DidCommOutOfBandState,
 } from '@credo-ts/didcomm'
-import { createAgent, MediatorAgent } from './agent.js'
+import { createAgent, MediatorAgent, shutdownAgent } from './agent.js'
 import { config } from './config.js'
+import { shutdownTelemetry } from './telemetry/sdk.js'
 
 function logInvitationUrl(agent: MediatorAgent, outOfBandRecord: DidCommOutOfBandRecord) {
   const httpEndpoint = config.agentEndpoints.find((e) => e.startsWith('http'))
@@ -29,13 +30,41 @@ async function createMediatorInvitation(agent: MediatorAgent) {
   })
 }
 
-void createAgent().then(async (agent) => {
+let runningAgent: MediatorAgent | undefined
+let shutdownPromise: Promise<void> | undefined
+
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
+  shutdownPromise ??= (async () => {
+    runningAgent?.config.logger.info(`Received ${signal}; shutting down`)
+    if (runningAgent) await shutdownAgent(runningAgent)
+    await shutdownTelemetry()
+  })()
+  return shutdownPromise
+}
+
+process.once('SIGINT', () => {
+  void shutdown('SIGINT').catch((error) => {
+    console.error('Graceful shutdown failed', error)
+    process.exitCode = 1
+  })
+})
+process.once('SIGTERM', () => {
+  void shutdown('SIGTERM').catch((error) => {
+    console.error('Graceful shutdown failed', error)
+    process.exitCode = 1
+  })
+})
+
+async function main(): Promise<void> {
+  const agent = await createAgent()
+  runningAgent = agent
   agent.config.logger.info('Agent started')
 
   if (config.createNewInvitation) {
     agent.config.logger.info('Recreating out of band invitation')
     const outOfBandRecord = await createMediatorInvitation(agent)
-    return logInvitationUrl(agent, outOfBandRecord)
+    logInvitationUrl(agent, outOfBandRecord)
+    return
   }
 
   const oobRepo = agent.dependencyManager.resolve(DidCommOutOfBandRepository)
@@ -56,4 +85,15 @@ void createAgent().then(async (agent) => {
   }
 
   logInvitationUrl(agent, outOfBandRecord)
+}
+
+void main().catch(async (error) => {
+  console.error('Mediator failed to start', error)
+  process.exitCode = 1
+  try {
+    if (runningAgent) await shutdownAgent(runningAgent)
+    await shutdownTelemetry()
+  } catch (shutdownError) {
+    console.error('Shutdown after startup failure failed', shutdownError)
+  }
 })
