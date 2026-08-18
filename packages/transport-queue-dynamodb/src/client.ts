@@ -370,10 +370,23 @@ export class DynamoDbClientRepository {
         : await this.getRecipientMessages(options.connectionId, options.recipientDid, options.limit)
 
     if (options.deleteMessages && messages.length > 0) {
-      await this.removeMessages({
-        connectionId: options.connectionId,
-        messageIds: messages.map((message) => message.id),
-      })
+      try {
+        await this.removeMessages({
+          connectionId: options.connectionId,
+          messageIds: messages.map((message) => message.id),
+        })
+      } catch (error) {
+        // Some independent transactions may already have committed by the
+        // time another transaction fails. Returning every fetched message
+        // preserves at-least-once delivery for both known and ambiguous
+        // transaction outcomes; any messages that remain queued may be
+        // delivered again, but committed deletes cannot cause message loss.
+        this.logger.error('Error removing fetched messages; returning them to preserve at-least-once delivery:', {
+          error,
+          connectionId: options.connectionId,
+          messageIds: messages.map((message) => message.id),
+        })
+      }
     }
     return messages
   }

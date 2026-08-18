@@ -465,6 +465,50 @@ suite('dynamodb recipient index', () => {
     }
   })
 
+  test('returns every fetched message when only some delete transactions succeed', async () => {
+    const messages = Array.from({ length: 51 }, (_, index) => ({
+      connectionId: { S: connectionId },
+      messageId: { N: String(index + 1) },
+      recipientDids: { L: [{ S: recipientDid }] },
+      receivedAt: { N: String(index) },
+    }))
+    const transactionSizes: number[] = []
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof QueryCommand) return { Items: messages } as never
+      if (command instanceof BatchGetItemCommand) {
+        return { Responses: { queued_messages: messages } } as never
+      }
+      if (command instanceof GetItemCommand) {
+        return {
+          Item: {
+            connectionId: { S: connectionId },
+            recipientMessageId: { S: '__recipient_index_metadata__' },
+            cutoverMessageId: { N: '0' },
+          },
+        } as never
+      }
+      if (command instanceof TransactWriteItemsCommand) {
+        const transactionSize = command.input.TransactItems?.length ?? 0
+        transactionSizes.push(transactionSize)
+        if (transactionSize === 100) throw new Error('first transaction failed')
+        return {} as never
+      }
+      return {} as never
+    })
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      const fetchedMessages = await client.getMessages({ connectionId, deleteMessages: true })
+
+      expect(transactionSizes).toEqual([100, 2])
+      expect(fetchedMessages.map((message) => message.id)).toEqual(messages.map((message) => message.messageId.N))
+    } finally {
+      send.mockRestore()
+    }
+  })
+
   test('retries a reasonless transaction cancellation during atomic deletion', async () => {
     const messageId = '1234567890123001'
     const transactionTokens: Array<string | undefined> = []
