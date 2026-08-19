@@ -211,6 +211,23 @@ export class DynamoDbClientRepository {
     return unmarshall(response.Item) as RecipientIndexMetadata
   }
 
+  private async getRecipientIndexMetadataForRead(connectionId: string): Promise<RecipientIndexMetadata | undefined> {
+    try {
+      return await this.getRecipientIndexMetadata(connectionId)
+    } catch (error) {
+      // The canonical queue table contains both legacy and indexed messages,
+      // so recipient-scoped reads can safely use its filtered query when the
+      // optional acceleration table is temporarily unavailable. Keep writes
+      // and deletes fail-closed because their metadata reads protect the
+      // cutover boundary and atomic index maintenance.
+      this.logger.warn('Unable to read recipient index metadata; falling back to the canonical queue table', {
+        connectionId,
+        error,
+      })
+      return undefined
+    }
+  }
+
   private async prepareRecipientIndex(connectionId: string): Promise<RecipientIndexMetadata> {
     // The write path must observe an existing cutover marker immediately. Read
     // paths can use the eventually consistent default because a transient miss
@@ -258,7 +275,7 @@ export class DynamoDbClientRepository {
     try {
       if (recipientDid === undefined) return await this.countMessagesByConnection(connectionId, maximumCount)
 
-      const metadata = await this.getRecipientIndexMetadata(connectionId)
+      const metadata = await this.getRecipientIndexMetadataForRead(connectionId)
       if (!metadata) return await this.countLegacyRecipientMessages(connectionId, recipientDid, undefined, maximumCount)
 
       const indexed = await this.countIndexedRecipientMessages(
@@ -408,7 +425,7 @@ export class DynamoDbClientRepository {
     recipientDid: string,
     limit?: number
   ): Promise<QueuedMessage[]> {
-    const metadata = await this.getRecipientIndexMetadata(connectionId)
+    const metadata = await this.getRecipientIndexMetadataForRead(connectionId)
     if (!metadata) return await this.getLegacyRecipientMessages(connectionId, recipientDid, undefined, limit)
 
     // Old messages sort before the post-cutover indexed entries, so read them

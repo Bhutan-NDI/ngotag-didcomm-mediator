@@ -148,6 +148,32 @@ suite('dynamodb recipient index', () => {
     }
   })
 
+  test('falls back to the canonical table when recipient metadata cannot be read while counting', async () => {
+    const metadataError = new Error('recipient index throttled')
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof GetItemCommand) throw metadataError
+      if (command instanceof QueryCommand && command.input.TableName === 'queued_messages') return { Count: 2 } as never
+      return {} as never
+    })
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      await expect(client.getMessageCount(connectionId, recipientDid, 10)).resolves.toBe(2)
+
+      const queries = send.mock.calls
+        .map(([command]) => command as unknown)
+        .filter((command): command is QueryCommand => command instanceof QueryCommand)
+      expect(queries).toHaveLength(1)
+      expect(queries[0].input.TableName).toBe('queued_messages')
+      expect(queries[0].input.FilterExpression).toBe('contains(recipientDids, :recipientDid)')
+      expect(queries[0].input.Limit).toBeUndefined()
+    } finally {
+      send.mockRestore()
+    }
+  })
+
   test('does not apply a pre-filter limit to a legacy recipient count', async () => {
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
@@ -265,6 +291,53 @@ suite('dynamodb recipient index', () => {
           ? canonicalRead.input.RequestItems?.queued_messages?.ConsistentRead
           : undefined
       ).toBe(true)
+    } finally {
+      send.mockRestore()
+    }
+  })
+
+  test('falls back to the canonical table when recipient metadata cannot be read while fetching', async () => {
+    const messageId = '1234567890123001'
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof GetItemCommand) throw new Error('recipient index unavailable')
+      if (command instanceof QueryCommand && command.input.TableName === 'queued_messages') {
+        return {
+          Items: [
+            {
+              connectionId: { S: connectionId },
+              messageId: { N: messageId },
+              recipientDids: { L: [{ S: recipientDid }] },
+              receivedAt: { N: '0' },
+              encryptedMessage: {
+                M: {
+                  ciphertext: { S: 'ciphertext' },
+                  iv: { S: 'iv' },
+                  protected: { S: 'protected' },
+                  tag: { S: 'tag' },
+                },
+              },
+            },
+          ],
+        } as never
+      }
+      return {} as never
+    })
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      await expect(client.getMessages({ connectionId, recipientDid, limit: 1 })).resolves.toEqual([
+        expect.objectContaining({ id: messageId, recipientDids: [recipientDid] }),
+      ])
+
+      const queries = send.mock.calls
+        .map(([command]) => command as unknown)
+        .filter((command): command is QueryCommand => command instanceof QueryCommand)
+      expect(queries).toHaveLength(1)
+      expect(queries[0].input.TableName).toBe('queued_messages')
+      expect(queries[0].input.FilterExpression).toBe('contains(recipientDids, :recipientDid)')
+      expect(send.mock.calls.some(([command]) => command instanceof BatchGetItemCommand)).toBe(false)
     } finally {
       send.mockRestore()
     }
