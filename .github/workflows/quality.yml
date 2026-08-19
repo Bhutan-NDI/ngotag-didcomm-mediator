@@ -3,6 +3,7 @@ name: Quality
 on:
   pull_request:
     branches:
+      - dev
       - main
   push:
     branches:
