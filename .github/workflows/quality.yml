@@ -6,7 +6,6 @@ on:
       - main
   push:
     branches:
-      - feat/dynamodb-recipient-specific-queue
       - main
 
 jobs:
