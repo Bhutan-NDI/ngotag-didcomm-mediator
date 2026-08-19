@@ -20,6 +20,7 @@ export async function loadMessagePickupStorage(): Promise<ExtendedQueueTransport
       logger,
       region: storage.region,
       tableName: storage.tableName,
+      recipientIndexTableName: storage.recipientIndexTableName,
       credentials: {
         accessKeyId: storage.accessKeyId,
         secretAccessKey: storage.secretAccessKey,
