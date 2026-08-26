@@ -5,8 +5,24 @@ import {
   DidCommOutOfBandRole,
   DidCommOutOfBandState,
 } from '@credo-ts/didcomm'
+import { LogLevel } from '@credo-ts/core'
 import { createAgent, MediatorAgent } from './agent.js'
 import { config } from './config.js'
+import { emitStructured } from './logger/StructuredLogger.js'
+
+process.on('unhandledRejection', (reason) => {
+  emitStructured(LogLevel.error, {
+    hop: 'mediator.process.unhandled_rejection',
+    notes: reason instanceof Error ? reason.stack ?? reason.message : String(reason),
+  })
+})
+
+process.on('uncaughtException', (error) => {
+  emitStructured(LogLevel.error, {
+    hop: 'mediator.process.uncaught_exception',
+    notes: error.stack ?? error.message,
+  })
+})
 
 function logInvitationUrl(agent: MediatorAgent, outOfBandRecord: DidCommOutOfBandRecord) {
   const httpEndpoint = config.agentEndpoints.find((e) => e.startsWith('http'))
@@ -56,4 +72,9 @@ void createAgent().then(async (agent) => {
   }
 
   logInvitationUrl(agent, outOfBandRecord)
+}).catch((error) => {
+  emitStructured(LogLevel.error, {
+    hop: 'mediator.process.uncaught_exception',
+    notes: error instanceof Error ? error.stack ?? error.message : String(error),
+  })
 })

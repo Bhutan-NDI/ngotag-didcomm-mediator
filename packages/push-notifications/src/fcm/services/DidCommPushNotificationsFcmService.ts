@@ -1,5 +1,5 @@
 import type { AgentContext, Logger } from '@credo-ts/core'
-import { CredoError, InjectionSymbols, inject, injectable } from '@credo-ts/core'
+import { CredoError, InjectionSymbols, RecordDuplicateError, inject, injectable } from '@credo-ts/core'
 import { DidCommInboundMessageContext } from '@credo-ts/didcomm'
 import {
   DidCommPushNotificationsFcmProblemReportReason,
@@ -96,7 +96,22 @@ export class DidCommPushNotificationsFcmService {
         devicePlatform: message.devicePlatform,
       })
 
-      await this.pushNotificationsFcmRepository.save(agentContext, pushNotificationsFcmRecord)
+      try {
+        await this.pushNotificationsFcmRepository.save(agentContext, pushNotificationsFcmRecord)
+      } catch (error) {
+        if (error instanceof RecordDuplicateError) {
+          // Concurrent set-device-info messages raced past the null check — re-fetch and update
+          this.logger.warn(`Duplicate device info record detected for connection ${connection.id}, re-fetching and updating`)
+          pushNotificationsFcmRecord = await this.pushNotificationsFcmRepository.getSingleByQuery(agentContext, {
+            connectionId: connection.id,
+          })
+          pushNotificationsFcmRecord.deviceToken = message.deviceToken
+          pushNotificationsFcmRecord.firebaseProjectId = undefined
+          await this.pushNotificationsFcmRepository.update(agentContext, pushNotificationsFcmRecord)
+        } else {
+          throw error
+        }
+      }
     }
   }
 
