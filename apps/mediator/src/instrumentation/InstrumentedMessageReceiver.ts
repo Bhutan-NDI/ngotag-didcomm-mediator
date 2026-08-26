@@ -10,12 +10,13 @@ import {
 } from '@credo-ts/didcomm'
 
 import {
-  elapsedSeconds,
   getJweFingerprint,
+  getWebSocketTelemetryContext,
   hashIdentifier,
+  instrumentOperation,
   messageProcessDuration,
   SpanKind,
-  withSpan,
+  withExtractedTelemetryContext,
 } from '../telemetry/api.js'
 
 @injectable()
@@ -47,34 +48,26 @@ export class InstrumentedMessageReceiver extends DidCommMessageReceiver {
     options?: Parameters<DidCommMessageReceiver['receiveMessage']>[1]
   ): Promise<void> {
     const transport = options?.session?.type?.toLowerCase() ?? 'internal'
-    const startedAt = process.hrtime.bigint()
     const fingerprint = getJweFingerprint(inboundMessage)
+    const telemetry = transport === 'websocket' ? getWebSocketTelemetryContext(options?.session) : undefined
 
-    await withSpan(
-      'didcomm.message.process',
-      {
-        kind: SpanKind.CONSUMER,
-        attributes: {
-          'messaging.system': 'didcomm',
-          'messaging.operation.name': 'process',
-          'messaging.operation.type': 'process',
-          'didcomm.transport': transport,
-          'didcomm.encrypted': fingerprint !== undefined,
-          'didcomm.message.fingerprint': fingerprint,
-          'didcomm.connection.id_hash': hashIdentifier(options?.connection?.id),
+    await withExtractedTelemetryContext(telemetry, () =>
+      instrumentOperation('didcomm.message.process', {
+        span: {
+          kind: SpanKind.CONSUMER,
+          attributes: {
+            'messaging.system': 'didcomm',
+            'messaging.operation.name': 'process',
+            'messaging.operation.type': 'process',
+            'didcomm.transport': transport,
+            'didcomm.encrypted': fingerprint !== undefined,
+            'didcomm.message.fingerprint': fingerprint,
+            'didcomm.connection.id_hash': hashIdentifier(options?.connection?.id),
+          },
         },
-      },
-      async () => {
-        let outcome = 'ok'
-        try {
-          await super.receiveMessage(inboundMessage, options)
-        } catch (error) {
-          outcome = 'error'
-          throw error
-        } finally {
-          messageProcessDuration.record(elapsedSeconds(startedAt), { transport, outcome })
-        }
-      }
+        callback: async () => super.receiveMessage(inboundMessage, options),
+        record: (outcome, elapsed) => messageProcessDuration.record(elapsed, { transport, outcome }),
+      })
     )
   }
 }

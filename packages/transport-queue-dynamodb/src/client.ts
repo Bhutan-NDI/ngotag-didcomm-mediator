@@ -22,6 +22,7 @@ export type AddQueuedMessageOptions = {
   receivedAt?: Date
   recipientDids: string[]
   encryptedMessage: DidCommEncryptedMessage
+  telemetry?: Record<string, string>
 }
 
 export type RemoveQueuedMessageOptions = {
@@ -312,11 +313,14 @@ export class DynamoDbClientRepository {
         connectionId: options.connectionId,
         messageId: Number(messageId),
       }),
-      UpdateExpression: 'set encryptedMessage = :em, recipientDids = :rd, receivedAt = :ra',
+      UpdateExpression: `set encryptedMessage = :em, recipientDids = :rd, receivedAt = :ra${
+        options.telemetry ? ', telemetry = :tc' : ''
+      }`,
       ExpressionAttributeValues: marshall({
         ':em': options.encryptedMessage,
         ':rd': options.recipientDids,
         ':ra': receivedAt.getTime(),
+        ...(options.telemetry ? { ':tc': options.telemetry } : {}),
       }),
     })
 

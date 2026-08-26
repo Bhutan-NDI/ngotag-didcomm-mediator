@@ -10,13 +10,12 @@ import {
 
 import { config } from '../config.js'
 import {
-  elapsedSeconds,
   forwardCounter,
   forwardDuration,
   getJweFingerprint,
   hashIdentifier,
+  instrumentOperation,
   SpanKind,
-  withSpan,
 } from '../telemetry/api.js'
 
 @injectable()
@@ -35,11 +34,8 @@ export class InstrumentedMediatorService extends DidCommMediatorService {
     messageContext: DidCommInboundMessageContext<DidCommForwardMessage>
   ): Promise<void> {
     const strategy = config.messagePickup.forwardingStrategy
-    const startedAt = process.hrtime.bigint()
-
-    await withSpan(
-      'didcomm.forward',
-      {
+    await instrumentOperation('didcomm.forward', {
+      span: {
         kind: SpanKind.INTERNAL,
         attributes: {
           'didcomm.forwarding.strategy': strategy,
@@ -47,20 +43,16 @@ export class InstrumentedMediatorService extends DidCommMediatorService {
           'didcomm.recipient_key.id_hash': hashIdentifier(messageContext.message.to),
         },
       },
-      async (span) => {
-        let outcome = 'ok'
-        try {
-          span.addEvent('didcomm.forward.strategy.selected', { strategy })
-          await super.processForwardMessage(messageContext)
-        } catch (error) {
-          outcome = 'undeliverable'
-          throw error
-        } finally {
-          const attributes = { strategy, outcome }
-          forwardCounter.add(1, attributes)
-          forwardDuration.record(elapsedSeconds(startedAt), attributes)
-        }
-      }
-    )
+      callback: async (span) => {
+        span.addEvent('didcomm.forward.strategy.selected', { strategy })
+        await super.processForwardMessage(messageContext)
+      },
+      errorOutcome: 'undeliverable',
+      record: (outcome, elapsed) => {
+        const attributes = { strategy, outcome }
+        forwardCounter.add(1, attributes)
+        forwardDuration.record(elapsed, attributes)
+      },
+    })
   }
 }

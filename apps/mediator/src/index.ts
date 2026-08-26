@@ -33,9 +33,9 @@ async function createMediatorInvitation(agent: MediatorAgent) {
 let runningAgent: MediatorAgent | undefined
 let shutdownPromise: Promise<void> | undefined
 
-async function shutdown(signal: NodeJS.Signals): Promise<void> {
+async function shutdown(reason: NodeJS.Signals | 'startup failure'): Promise<void> {
   shutdownPromise ??= (async () => {
-    runningAgent?.config.logger.info(`Received ${signal}; shutting down`)
+    runningAgent?.config.logger.info(`Received ${reason}; shutting down`)
     if (runningAgent) await shutdownAgent(runningAgent)
     await shutdownTelemetry()
   })()
@@ -91,8 +91,7 @@ void main().catch(async (error) => {
   console.error('Mediator failed to start', error)
   process.exitCode = 1
   try {
-    if (runningAgent) await shutdownAgent(runningAgent)
-    await shutdownTelemetry()
+    await shutdown('startup failure')
   } catch (shutdownError) {
     console.error('Shutdown after startup failure failed', shutdownError)
   }

@@ -2,9 +2,11 @@ import { createHash } from 'node:crypto'
 import {
   type Attributes,
   context,
+  type Link,
   metrics,
   propagation,
   type Span,
+  type SpanContext,
   SpanKind,
   type SpanOptions,
   SpanStatusCode,
@@ -75,6 +77,14 @@ export const pushNotificationDuration = meter.createHistogram('didcomm.push.dura
 
 export type TelemetryCarrier = Record<string, string>
 
+type TelemetryHeaders = Record<string, string | string[] | undefined>
+
+const queuedTelemetry = new Map<
+  string,
+  Array<{ messageCarriers: TelemetryCarrier[]; consumerCarrier: TelemetryCarrier }>
+>()
+const websocketTelemetry = new WeakMap<object, TelemetryCarrier>()
+
 export function elapsedSeconds(startedAt: bigint): number {
   return Number(process.hrtime.bigint() - startedAt) / 1e9
 }
@@ -90,6 +100,14 @@ export function getJweFingerprint(payload: unknown): string | undefined {
     if (!parsed || typeof parsed !== 'object') return undefined
     const iv = (parsed as Record<string, unknown>).iv
     return typeof iv === 'string' ? hashIdentifier(iv) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function getServerAddress(endpoint: string | undefined): string | undefined {
+  try {
+    return endpoint ? new URL(endpoint).hostname : undefined
   } catch {
     return undefined
   }
@@ -133,6 +151,37 @@ export async function withSpan<T>(
   })
 }
 
+export async function instrumentOperation<T>(
+  name: string,
+  options: {
+    span: SpanOptions
+    callback: (span: Span) => Promise<T>
+    record: (outcome: string, elapsed: number) => void
+    successOutcome?: string
+    errorOutcome?: string
+    resultOutcome?: (result: T) => string
+  }
+): Promise<T> {
+  const startedAt = process.hrtime.bigint()
+  const successOutcome = options.successOutcome ?? 'ok'
+  let outcome = options.errorOutcome ?? 'error'
+
+  return withSpan(name, options.span, async (span) => {
+    try {
+      const result = await options.callback(span)
+      outcome = options.resultOutcome?.(result) ?? successOutcome
+      if (outcome !== successOutcome) span.setStatus({ code: SpanStatusCode.ERROR })
+      return result
+    } finally {
+      try {
+        options.record(outcome, elapsedSeconds(startedAt))
+      } catch {
+        // Telemetry must never change application behaviour.
+      }
+    }
+  })
+}
+
 export function activeSpan(): Span | undefined {
   return trace.getActiveSpan()
 }
@@ -141,13 +190,63 @@ export function injectTelemetryContext(): TelemetryCarrier {
   const injected: TelemetryCarrier = {}
   propagation.inject(context.active(), injected)
 
-  // Redis stream messages are persisted. Carry only W3C trace context and never
-  // persist baggage, which may contain arbitrary application metadata.
+  // Redis and queue messages are persisted. Carry only W3C trace context and
+  // never persist baggage, which may contain arbitrary application metadata.
   const carrier: TelemetryCarrier = {}
   for (const key of ['traceparent', 'tracestate']) {
     if (injected[key]) carrier[key] = injected[key]
   }
   return carrier
+}
+
+function telemetryCarrierFromHeaders(headers: TelemetryHeaders): TelemetryCarrier {
+  const carrier: TelemetryCarrier = {}
+  for (const key of ['traceparent', 'tracestate']) {
+    const value = headers[key]
+    if (typeof value === 'string') carrier[key] = value
+  }
+  return carrier
+}
+
+export function registerWebSocketTelemetryContext(socket: object, headers: TelemetryHeaders): void {
+  const carrier = telemetryCarrierFromHeaders(headers)
+  if (carrier.traceparent) websocketTelemetry.set(socket, carrier)
+}
+
+export function getWebSocketTelemetryContext(session: unknown): TelemetryCarrier | undefined {
+  if (!session || typeof session !== 'object') return undefined
+  const socket = (session as { socket?: unknown }).socket
+  return socket && typeof socket === 'object' ? websocketTelemetry.get(socket) : undefined
+}
+
+export function rememberQueuedTelemetry(connectionId: string, carriers: Array<TelemetryCarrier | undefined>): void {
+  const validCarriers = carriers.filter((carrier): carrier is TelemetryCarrier => carrier?.traceparent !== undefined)
+  if (validCarriers.length === 0) return
+
+  const pending = queuedTelemetry.get(connectionId) ?? []
+  pending.push({ messageCarriers: validCarriers, consumerCarrier: injectTelemetryContext() })
+  queuedTelemetry.set(connectionId, pending)
+}
+
+function getSpanContext(carrier: TelemetryCarrier): SpanContext | undefined {
+  return trace.getSpanContext(propagation.extract(context.active(), carrier))
+}
+
+export function withQueuedTelemetryContext<T>(connectionId: string | undefined, callback: (links: Link[]) => T): T {
+  if (!connectionId) return callback([])
+
+  const pending = queuedTelemetry.get(connectionId)
+  const telemetry = pending?.shift()
+  if (!telemetry) return callback([])
+  if (!pending || pending.length === 0) queuedTelemetry.delete(connectionId)
+
+  const parentContext = propagation.extract(context.active(), telemetry.messageCarriers[0])
+  const links = [...telemetry.messageCarriers.slice(1), telemetry.consumerCarrier]
+    .map(getSpanContext)
+    .filter((spanContext): spanContext is SpanContext => spanContext !== undefined)
+    .map((spanContext) => ({ context: spanContext }))
+
+  return context.with(parentContext, () => callback(links))
 }
 
 export function withExtractedTelemetryContext<T>(carrier: TelemetryCarrier | undefined, callback: () => T): T {

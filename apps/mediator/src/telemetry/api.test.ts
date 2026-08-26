@@ -1,8 +1,21 @@
-import { SpanStatusCode, trace } from '@opentelemetry/api'
+import { propagation, SpanStatusCode, trace } from '@opentelemetry/api'
+import { core } from '@opentelemetry/sdk-node'
 import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 
-import { getJweFingerprint, getProtocolAttributes, hashIdentifier, SpanKind, withSpan } from './api.js'
+import {
+  getJweFingerprint,
+  getProtocolAttributes,
+  getServerAddress,
+  getWebSocketTelemetryContext,
+  hashIdentifier,
+  instrumentOperation,
+  registerWebSocketTelemetryContext,
+  rememberQueuedTelemetry,
+  SpanKind,
+  withQueuedTelemetryContext,
+  withSpan,
+} from './api.js'
 
 const exporter = new InMemorySpanExporter()
 const provider = new BasicTracerProvider({
@@ -11,10 +24,12 @@ const provider = new BasicTracerProvider({
 
 beforeAll(() => {
   trace.setGlobalTracerProvider(provider)
+  propagation.setGlobalPropagator(new core.W3CTraceContextPropagator())
 })
 
 afterAll(async () => {
   await provider.shutdown()
+  propagation.disable()
   trace.disable()
 })
 
@@ -36,6 +51,53 @@ describe('telemetry API', () => {
       'didcomm.protocol.name': 'messagepickup',
       'didcomm.protocol.version': '3.0',
     })
+    expect(getServerAddress('wss://mediator.example/path')).toBe('mediator.example')
+    expect(getServerAddress('not a URL')).toBeUndefined()
+  })
+
+  test('records operation outcomes consistently', async () => {
+    const outcomes: string[] = []
+
+    await instrumentOperation('successful-instrumented-operation', {
+      span: { kind: SpanKind.INTERNAL },
+      callback: async () => true,
+      resultOutcome: (result) => (result ? 'ok' : 'error'),
+      record: (outcome) => outcomes.push(outcome),
+    })
+    await expect(
+      instrumentOperation('failed-instrumented-operation', {
+        span: { kind: SpanKind.INTERNAL },
+        callback: async () => {
+          throw new Error('expected failure')
+        },
+        errorOutcome: 'undeliverable',
+        record: (outcome) => outcomes.push(outcome),
+      })
+    ).rejects.toThrow('expected failure')
+
+    expect(outcomes).toEqual(['ok', 'undeliverable'])
+  })
+
+  test('restores queued and websocket W3C metadata without modifying a DIDComm message', async () => {
+    const enqueueCarrier = {
+      traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+    }
+    const secondCarrier = {
+      traceparent: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
+    }
+
+    rememberQueuedTelemetry('connection-id', [enqueueCarrier, secondCarrier])
+    let queuedLinks = 0
+    await withQueuedTelemetryContext('connection-id', (links) =>
+      withSpan('queued-delivery', { kind: SpanKind.PRODUCER, links }, async () => {
+        queuedLinks = links.length
+      })
+    )
+
+    const socket = {}
+    registerWebSocketTelemetryContext(socket, enqueueCarrier)
+    expect(getWebSocketTelemetryContext({ socket })).toEqual(enqueueCarrier)
+    expect(queuedLinks).toBe(1)
   })
 
   test('ends successful spans and records failures', async () => {

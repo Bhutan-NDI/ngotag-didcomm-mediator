@@ -1,5 +1,6 @@
 import { BaseRecord, utils } from '@credo-ts/core'
 import type { DidCommEncryptedMessage } from '@credo-ts/didcomm'
+import type { TelemetryCarrier } from '../telemetry/api.js'
 
 export type DefaultMessageRecordTags = {
   connectionId: string
@@ -10,12 +11,14 @@ export interface MessageRecordStorageProps {
   createdAt?: Date
   connectionId: string
   message: DidCommEncryptedMessage
+  telemetry?: TelemetryCarrier
 }
 
 export class MessageRecord extends BaseRecord<DefaultMessageRecordTags> implements MessageRecordStorageProps {
   public sentTime!: string
   public connectionId!: string
   public message!: DidCommEncryptedMessage
+  public telemetry?: TelemetryCarrier
 
   public static override readonly type = 'MessageRecord'
   public override readonly type = MessageRecord.type
@@ -28,6 +31,7 @@ export class MessageRecord extends BaseRecord<DefaultMessageRecordTags> implemen
       this.createdAt = props.createdAt ?? new Date()
       this.connectionId = props.connectionId
       this.message = props.message
+      this.telemetry = props.telemetry
     }
   }
 

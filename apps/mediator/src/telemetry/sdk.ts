@@ -18,7 +18,7 @@ import {
   ATTR_URL_QUERY,
 } from '@opentelemetry/semantic-conventions'
 
-const sdkDisabled = process.env.OTEL_SDK_DISABLED?.toLowerCase() === 'true'
+const sdkEnabled = process.env.OTEL_ENABLED?.toLowerCase() === 'true'
 
 let sdk: NodeSDK | undefined
 let shutdownPromise: Promise<void> | undefined
@@ -29,7 +29,7 @@ function positiveInteger(value: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
-if (!sdkDisabled) {
+if (sdkEnabled) {
   const resource = defaultResource().merge(
     resourceFromAttributes({
       [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME ?? 'didcomm-mediator',

@@ -34,6 +34,7 @@ import {
   wsSessionOpened,
 } from './instrumentation/metrics.js'
 import { StorageServiceMessageQueue } from './storage/StorageMessageQueue.js'
+import { registerWebSocketTelemetryContext } from './telemetry/api.js'
 import { InstrumentedHttpOutboundTransport } from './transports/InstrumentedHttpOutboundTransport.js'
 import { InstrumentedTransportService } from './transports/InstrumentedTransportService.js'
 import { InstrumentedWsOutboundTransport } from './transports/InstrumentedWsOutboundTransport.js'
@@ -83,7 +84,8 @@ async function createModules({
 }
 
 function instrumentSocketServer(socketServer: WebSocketServer): void {
-  socketServer.on('connection', (socket: WebSocket) => {
+  socketServer.on('connection', (socket: WebSocket, request) => {
+    registerWebSocketTelemetryContext(socket, request.headers)
     wsSessionOpened()
     socket.on('close', () => {
       wsSessionClosed()

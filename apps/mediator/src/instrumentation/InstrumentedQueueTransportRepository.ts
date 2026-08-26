@@ -9,15 +9,17 @@ import type {
 
 import type { ExtendedQueueTransportRepository } from '../config/messagePickupLoader.js'
 import {
-  elapsedSeconds,
   getJweFingerprint,
   hashIdentifier,
+  injectTelemetryContext,
+  instrumentOperation,
   queueBatchSize,
   queueMessageAge,
   queueOperationCounter,
   queueOperationDuration,
+  rememberQueuedTelemetry,
   SpanKind,
-  withSpan,
+  type TelemetryCarrier,
 } from '../telemetry/api.js'
 
 type QueueOperation = 'enqueue' | 'receive' | 'settle' | 'count'
@@ -47,10 +49,8 @@ export class InstrumentedQueueTransportRepository implements ExtendedQueueTransp
     callback: () => T | Promise<T>,
     attributes: Record<string, string | number | boolean | undefined> = {}
   ): Promise<T> {
-    const startedAt = process.hrtime.bigint()
-    return withSpan(
-      `${operation} didcomm.pickup.queue`,
-      {
+    return instrumentOperation(`${operation} didcomm.pickup.queue`, {
+      span: {
         kind,
         attributes: {
           'messaging.system': 'didcomm',
@@ -62,20 +62,13 @@ export class InstrumentedQueueTransportRepository implements ExtendedQueueTransp
           ...attributes,
         },
       },
-      async () => {
-        let outcome = 'ok'
-        try {
-          return await callback()
-        } catch (error) {
-          outcome = 'error'
-          throw error
-        } finally {
-          const metricAttributes = { backend: this.backend, operation, outcome }
-          queueOperationCounter.add(1, metricAttributes)
-          queueOperationDuration.record(elapsedSeconds(startedAt), metricAttributes)
-        }
-      }
-    )
+      callback: async () => callback(),
+      record: (outcome, elapsed) => {
+        const metricAttributes = { backend: this.backend, operation, outcome }
+        queueOperationCounter.add(1, metricAttributes)
+        queueOperationDuration.record(elapsed, metricAttributes)
+      },
+    })
   }
 
   public getAvailableMessageCount(
@@ -107,6 +100,10 @@ export class InstrumentedQueueTransportRepository implements ExtendedQueueTransp
             queueMessageAge.record(Math.max(0, now - message.receivedAt.getTime()) / 1000, { backend: this.backend })
           }
         }
+        rememberQueuedTelemetry(
+          options.connectionId,
+          messages.map((message) => (message as QueuedDidCommMessage & { telemetry?: TelemetryCarrier }).telemetry)
+        )
         return messages
       },
       { 'messaging.batch.message_count': options.limit }
@@ -118,7 +115,11 @@ export class InstrumentedQueueTransportRepository implements ExtendedQueueTransp
       'enqueue',
       options.connectionId,
       SpanKind.PRODUCER,
-      () => this.inner.addMessage(agentContext, options),
+      () =>
+        this.inner.addMessage(agentContext, {
+          ...options,
+          telemetry: injectTelemetryContext(),
+        } as AddMessageOptions),
       { 'didcomm.message.fingerprint': getJweFingerprint(options.payload) }
     )
   }

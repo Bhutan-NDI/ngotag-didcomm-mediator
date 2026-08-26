@@ -1,4 +1,10 @@
-import { CreateTableCommand, DescribeTableCommand, DynamoDBClient, QueryCommand } from '@aws-sdk/client-dynamodb'
+import {
+  CreateTableCommand,
+  DescribeTableCommand,
+  DynamoDBClient,
+  QueryCommand,
+  UpdateItemCommand,
+} from '@aws-sdk/client-dynamodb'
 import { AgentContext, ConsoleLogger, DependencyManager, LogLevel } from '@credo-ts/core'
 import { expect, suite, test, vi } from 'vitest'
 import { DynamoDbClientRepository } from '../src/client.js'
@@ -65,6 +71,34 @@ suite('dynamodb client count query', () => {
 
     try {
       await expect(DynamoDbClientRepository.initialize(clientOptions)).rejects.toThrow('incompatible schema')
+    } finally {
+      send.mockRestore()
+    }
+  })
+
+  test('persists W3C trace context alongside the encrypted message', async () => {
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      return {} as never
+    })
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      await client.addMessage({
+        connectionId,
+        recipientDids: [recipientDid],
+        encryptedMessage: { protected: 'protected', iv: 'iv', ciphertext: 'ciphertext', tag: 'tag' },
+        telemetry: { traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' },
+      })
+
+      const update = send.mock.calls.find(([command]) => command instanceof UpdateItemCommand)?.[0] as UpdateItemCommand
+      expect(update.input.UpdateExpression).toContain('telemetry = :tc')
+      expect(update.input.ExpressionAttributeValues?.[':tc']).toEqual({
+        M: {
+          traceparent: { S: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' },
+        },
+      })
     } finally {
       send.mockRestore()
     }

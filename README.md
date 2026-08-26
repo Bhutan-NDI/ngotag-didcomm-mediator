@@ -148,7 +148,7 @@ Configure the SDK with standard OpenTelemetry environment variables:
 
 | Environment Variable | Default | Description |
 | --- | --- | --- |
-| `OTEL_SDK_DISABLED` | `false` | Set to `true` to disable SDK registration and export while retaining no-op API calls. |
+| `OTEL_ENABLED` | `false` | Set to `true` to register the SDK and export telemetry. |
 | `OTEL_SERVICE_NAME` | `didcomm-mediator` | Service name attached to telemetry. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | Base endpoint for an OTLP/HTTP collector. Per-signal endpoints are also supported. |
 | `OTEL_TRACES_SAMPLER` | SDK default | For production, `parentbased_traceidratio` is recommended. |
@@ -159,6 +159,7 @@ Configure the SDK with standard OpenTelemetry environment variables:
 For example:
 
 ```sh
+OTEL_ENABLED=true \
 OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
 OTEL_SERVICE_NAME=didcomm-mediator \
 OTEL_TRACES_SAMPLER=parentbased_traceidratio \
@@ -166,7 +167,7 @@ OTEL_TRACES_SAMPLER_ARG=0.1 \
 pnpm --filter didcomm-mediator-service start
 ```
 
-Application logs include `trace_id`, `span_id`, and `trace_flags` whenever a valid span is active, so an observability backend can correlate logs and traces. DIDComm payloads, plaintext, device tokens, credentials, and raw identifiers are not attached to OTel telemetry; span-only correlation identifiers are one-way hashes. Metric labels are intentionally low-cardinality.
+Application logs include `trace_id`, `span_id`, and `trace_flags` whenever a valid span is active, so an observability backend can correlate logs and traces. Queue backends persist only W3C trace context in a sidecar field (never in the encrypted DIDComm envelope), and inbound WebSocket sessions restore W3C context supplied on the HTTP upgrade request. DIDComm payloads, plaintext, device tokens, credentials, and raw identifiers are not attached to OTel telemetry; span-only correlation identifiers are one-way hashes. Metric labels are intentionally low-cardinality.
 
 ### 2. JSON Configuration File
 

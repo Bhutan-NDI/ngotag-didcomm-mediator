@@ -52,9 +52,11 @@ export class DidCommTransportQueueDynamoDb implements DidCommQueueTransportRepos
   }
 
   public async addMessage(agentContext: AgentContext, options: AddMessageOptions): Promise<string> {
+    const telemetry = (options as AddMessageOptions & { telemetry?: Record<string, string> }).telemetry
     const id = await this.client.addMessage({
       ...options,
       encryptedMessage: options.payload,
+      telemetry,
     })
 
     this.emitMessageQueuedEvent(agentContext, options.connectionId)

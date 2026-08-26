@@ -9,11 +9,10 @@ import { sendNotification } from '../push-notifications/sendNotification.js'
 import {
   deliveryCounter,
   deliveryDuration,
-  elapsedSeconds,
   hashIdentifier,
+  instrumentOperation,
   SpanKind,
   withExtractedTelemetryContext,
-  withSpan,
 } from '../telemetry/api.js'
 
 async function consumeRedisDelivery<T>(
@@ -21,11 +20,9 @@ async function consumeRedisDelivery<T>(
   telemetry: Record<string, string> | undefined,
   callback: () => Promise<T>
 ): Promise<T> {
-  return withExtractedTelemetryContext(telemetry, () => {
-    const startedAt = process.hrtime.bigint()
-    return withSpan(
-      'didcomm.delivery.redis.consume',
-      {
+  return withExtractedTelemetryContext(telemetry, () =>
+    instrumentOperation('didcomm.delivery.redis.consume', {
+      span: {
         kind: SpanKind.CONSUMER,
         attributes: {
           'messaging.system': 'redis',
@@ -35,21 +32,14 @@ async function consumeRedisDelivery<T>(
           'didcomm.connection.id_hash': hashIdentifier(connectionId),
         },
       },
-      async () => {
-        let outcome = 'ok'
-        try {
-          return await callback()
-        } catch (error) {
-          outcome = 'error'
-          throw error
-        } finally {
-          const attributes = { transport: 'redis', outcome }
-          deliveryCounter.add(1, attributes)
-          deliveryDuration.record(elapsedSeconds(startedAt), attributes)
-        }
-      }
-    )
-  })
+      callback: async () => callback(),
+      record: (outcome, elapsed) => {
+        const attributes = { transport: 'redis', outcome }
+        deliveryCounter.add(1, attributes)
+        deliveryDuration.record(elapsed, attributes)
+      },
+    })
+  )
 }
 
 /**

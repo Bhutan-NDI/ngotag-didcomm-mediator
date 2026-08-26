@@ -1,0 +1,2 @@
+ALTER TABLE queued_message
+ADD COLUMN IF NOT EXISTS telemetry JSONB;

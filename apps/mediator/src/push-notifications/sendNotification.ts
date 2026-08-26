@@ -2,13 +2,11 @@ import { AgentContext } from '@credo-ts/core'
 import { DidCommPushNotificationsFcmRepository } from '@credo-ts/didcomm-push-notifications'
 import { config } from '../config.js'
 import {
-  elapsedSeconds,
   hashIdentifier,
+  instrumentOperation,
   pushNotificationCounter,
   pushNotificationDuration,
   SpanKind,
-  SpanStatusCode,
-  withSpan,
 } from '../telemetry/api.js'
 import { sendFcmPushNotification } from './fcm/events/PushNotificationEvent.js'
 
@@ -18,30 +16,22 @@ async function instrumentPush<T>(
   callback: () => Promise<T>,
   isSuccess: (result: T) => boolean
 ): Promise<T> {
-  const startedAt = process.hrtime.bigint()
-  return withSpan(
-    `didcomm.push.${channel}`,
-    {
+  return instrumentOperation(`didcomm.push.${channel}`, {
+    span: {
       kind: SpanKind.CLIENT,
       attributes: {
         'didcomm.push.channel': channel,
         'didcomm.connection.id_hash': hashIdentifier(connectionId),
       },
     },
-    async (span) => {
-      let outcome = 'error'
-      try {
-        const result = await callback()
-        outcome = isSuccess(result) ? 'ok' : 'error'
-        if (outcome === 'error') span.setStatus({ code: SpanStatusCode.ERROR })
-        return result
-      } finally {
-        const attributes = { channel, outcome }
-        pushNotificationCounter.add(1, attributes)
-        pushNotificationDuration.record(elapsedSeconds(startedAt), attributes)
-      }
-    }
-  )
+    callback: async () => callback(),
+    resultOutcome: (result) => (isSuccess(result) ? 'ok' : 'error'),
+    record: (outcome, elapsed) => {
+      const attributes = { channel, outcome }
+      pushNotificationCounter.add(1, attributes)
+      pushNotificationDuration.record(elapsed, attributes)
+    },
+  })
 }
 
 export async function sendNotification(agentContext: AgentContext, connectionId: string) {
