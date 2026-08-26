@@ -4,8 +4,7 @@ import Redis from 'ioredis'
 import type { MediatorAgent } from '../agent.js'
 import { config } from '../config.js'
 import { DidcommMessageQueuedEvent, MediatorEventTypes } from '../events.js'
-import { shouldCredoOwnLocalDelivery } from '../message-delivery/deliveryOwnership.js'
-import { isInForwardDeliveryContext } from '../message-delivery/forwardDeliveryContext.js'
+import { getForwardDeliveryCompletion } from '../message-delivery/forwardDeliveryContext.js'
 import { KeyedSingleFlight } from '../message-delivery/KeyedSingleFlight.js'
 import { RedisStreamMessagePublishing } from '../multi-instance/redis-stream-message-publishing/redisStreamMessagePublishing.js'
 import { sendNotification } from '../push-notifications/sendNotification.js'
@@ -78,40 +77,24 @@ export async function loadRedisMessageDelivery({
     )
 
     if (config.messagePickup.forwardingStrategy !== DidCommMessageForwardingStrategy.DirectDelivery) {
-      const isForwardQueueEvent = isInForwardDeliveryContext()
-
       // In QueueAndLiveModeDelivery, Credo's processForwardMessage queues the
-      // message and then performs local delivery itself. The queue event is
-      // emitted before that delivery, so handling it here too races two reads
-      // and two WebSocket sends for the same message. Only skip events marked
-      // by that path; messages queued by any other caller still use this path.
+      // message before attempting local delivery. Wait for that attempt before
+      // draining again so both paths never read and send the same queue item in
+      // parallel. The follow-up drain also preserves the normal remote-server
+      // and push-notification fallback if the local session disappears before
+      // Credo reaches its delivery check.
+      const forwardDeliveryCompletion = getForwardDeliveryCompletion()
       if (
         config.messagePickup.forwardingStrategy === DidCommMessageForwardingStrategy.QueueAndLiveModeDelivery &&
-        isForwardQueueEvent
+        forwardDeliveryCompletion
       ) {
-        try {
-          const session = await agent.didcomm.messagePickup.getLiveModeSession({
-            connectionId,
-            role: DidCommMessagePickupSessionRole.MessageHolder,
-          })
+        agent.config.logger.debug('Waiting for Credo forward delivery before handling the queued-message event.', {
+          connectionId,
+        })
+        await forwardDeliveryCompletion
+      }
 
-          if (
-            shouldCredoOwnLocalDelivery({
-              forwardingStrategy: config.messagePickup.forwardingStrategy,
-              hasLocalSession: Boolean(session),
-              isForwardQueueEvent,
-            })
-          ) {
-            agent.config.logger.debug(
-              'Credo forward delivery owns the local session; skipping duplicate Redis-triggered delivery.',
-              { connectionId }
-            )
-            return
-          }
-        } catch (error) {
-          agent.config.logger.debug('Unable to verify local forward-delivery ownership.', { connectionId, error })
-        }
-      } else if (await localDelivery.schedule(connectionId)) {
+      if (await localDelivery.schedule(connectionId)) {
         return
       }
     }

@@ -11,9 +11,9 @@ import {
 import { runInForwardDeliveryContext } from './forwardDeliveryContext.js'
 
 /**
- * Marks queue events emitted by Credo's forward-message path. In
- * QueueAndLiveModeDelivery, Credo owns the subsequent local delivery, so the
- * Redis queue-event listener can avoid racing the exact same queue read/send.
+ * Coordinates queue events emitted by Credo's forward-message path. In
+ * QueueAndLiveModeDelivery, Credo performs local delivery after queueing, so
+ * the Redis queue-event listener waits for that attempt before draining again.
  */
 @injectable()
 export class CoordinatedMediatorService extends DidCommMediatorService {

@@ -56,13 +56,39 @@ describe('KeyedSingleFlight', () => {
     const second = singleFlight.schedule('connection-1')
     const third = singleFlight.schedule('connection-1')
 
-    expect(second).toBe(first)
-    expect(third).toBe(first)
+    expect(second).not.toBe(first)
+    expect(third).toBe(second)
 
     releaseFirstRun.resolve()
-    await expect(first).resolves.toBe(2)
+    await expect(first).resolves.toBe(1)
+    await expect(second).resolves.toBe(2)
     expect(taskCalls).toBe(2)
     expect(maximumActiveTasks).toBe(1)
+  })
+
+  test('reports each run result to the triggers coalesced into that run', async () => {
+    const firstRunStarted = deferred()
+    const releaseFirstRun = deferred()
+    let taskCalls = 0
+
+    const singleFlight = new KeyedSingleFlight(async () => {
+      taskCalls += 1
+      if (taskCalls === 1) {
+        firstRunStarted.resolve()
+        await releaseFirstRun.promise
+        return true
+      }
+
+      return false
+    })
+
+    const first = singleFlight.schedule('connection-1')
+    await firstRunStarted.promise
+    const followUp = singleFlight.schedule('connection-1')
+
+    releaseFirstRun.resolve()
+    await expect(first).resolves.toBe(true)
+    await expect(followUp).resolves.toBe(false)
   })
 
   test('runs different connections concurrently', async () => {
