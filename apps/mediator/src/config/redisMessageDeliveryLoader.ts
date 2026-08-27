@@ -73,6 +73,20 @@ export async function loadRedisMessageDelivery({
     }
   })
 
+  const scheduleLocalDelivery = async (connectionId: string) => {
+    const delivery = localDelivery.schedule(connectionId)
+
+    // One owner handles the result and fallback for each coalesced run. Other
+    // callers can return because the owner drains every queued message for the
+    // connection and performs the single required fallback side effect.
+    if (!delivery.isOwner) return
+
+    // A follow-up run can wait behind an active delivery. Start its timeout only
+    // after the run begins, not while it is waiting for the per-key lock.
+    await delivery.started
+    return await settleWithin(delivery.result, LOCAL_DELIVERY_TIMEOUT_MS)
+  }
+
   agent.events.on<DidcommMessageQueuedEvent>(MediatorEventTypes.DidCommMessageQueued, async (event) => {
     const connectionId = event.payload.connectionId
 
@@ -81,7 +95,9 @@ export async function loadRedisMessageDelivery({
     )
 
     if (config.messagePickup.forwardingStrategy !== DidCommMessageForwardingStrategy.DirectDelivery) {
-      const delivery = await settleWithin(localDelivery.schedule(connectionId), LOCAL_DELIVERY_TIMEOUT_MS)
+      const delivery = await scheduleLocalDelivery(connectionId)
+
+      if (!delivery) return
 
       if (delivery.status === 'completed' && delivery.value) {
         return
@@ -153,10 +169,9 @@ export async function loadRedisMessageDelivery({
         `Server '${streamPublishing.serverId}' received message ${message.id} for connection '${message.payload.connectionId}'. Attempting to deliver to local session.`
       )
 
-      const delivery = await settleWithin(
-        localDelivery.schedule(message.payload.connectionId),
-        LOCAL_DELIVERY_TIMEOUT_MS
-      )
+      const delivery = await scheduleLocalDelivery(message.payload.connectionId)
+
+      if (!delivery) return
 
       if (delivery.status === 'completed' && delivery.value) {
         // We delivered the messages, so no push notification is needed. If

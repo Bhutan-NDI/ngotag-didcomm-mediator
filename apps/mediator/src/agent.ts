@@ -327,7 +327,11 @@ export async function createAgent() {
       notes: 'effective config at startup',
       instrumentation_enabled: true,
       log_level: config.logLevel,
-      message_forwarding_strategy: config.messagePickup.forwardingStrategy,
+      message_forwarding_strategy: resolveCredoMessageForwardingStrategy({
+        configuredStrategy: config.messagePickup.forwardingStrategy,
+        multiInstanceDeliveryType: config.messagePickup.multiInstanceDelivery.type,
+      }),
+      configured_message_forwarding_strategy: config.messagePickup.forwardingStrategy,
       message_pickup_storage: config.messagePickup.storage.type,
       multi_instance_delivery: config.messagePickup.multiInstanceDelivery.type,
       cache_type: config.cache.type,

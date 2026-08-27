@@ -13,7 +13,7 @@ function deferred() {
 }
 
 describe('KeyedSingleFlight', () => {
-  test('coalesces a synchronous burst into one run', async () => {
+  test('coalesces a synchronous burst into one run with one owner', async () => {
     let taskCalls = 0
     const singleFlight = new KeyedSingleFlight(async () => {
       taskCalls += 1
@@ -24,9 +24,12 @@ describe('KeyedSingleFlight', () => {
     const second = singleFlight.schedule('connection-1')
     const third = singleFlight.schedule('connection-1')
 
-    expect(second).toBe(first)
-    expect(third).toBe(first)
-    await expect(first).resolves.toBe(1)
+    expect(first.isOwner).toBe(true)
+    expect(second.isOwner).toBe(false)
+    expect(third.isOwner).toBe(false)
+    expect(second.result).toBe(first.result)
+    expect(third.result).toBe(first.result)
+    await expect(first.result).resolves.toBe(1)
     expect(taskCalls).toBe(1)
   })
 
@@ -56,12 +59,15 @@ describe('KeyedSingleFlight', () => {
     const second = singleFlight.schedule('connection-1')
     const third = singleFlight.schedule('connection-1')
 
-    expect(second).not.toBe(first)
-    expect(third).toBe(second)
+    expect(first.isOwner).toBe(true)
+    expect(second.isOwner).toBe(true)
+    expect(third.isOwner).toBe(false)
+    expect(second.result).not.toBe(first.result)
+    expect(third.result).toBe(second.result)
 
     releaseFirstRun.resolve()
-    await expect(first).resolves.toBe(1)
-    await expect(second).resolves.toBe(2)
+    await expect(first.result).resolves.toBe(1)
+    await expect(second.result).resolves.toBe(2)
     expect(taskCalls).toBe(2)
     expect(maximumActiveTasks).toBe(1)
   })
@@ -87,8 +93,8 @@ describe('KeyedSingleFlight', () => {
     const followUp = singleFlight.schedule('connection-1')
 
     releaseFirstRun.resolve()
-    await expect(first).resolves.toBe(true)
-    await expect(followUp).resolves.toBe(false)
+    await expect(first.result).resolves.toBe(true)
+    await expect(followUp.result).resolves.toBe(false)
   })
 
   test('runs different connections concurrently', async () => {
@@ -111,9 +117,11 @@ describe('KeyedSingleFlight', () => {
     const second = singleFlight.schedule('connection-2')
     await bothRunsStarted.promise
 
+    expect(first.isOwner).toBe(true)
+    expect(second.isOwner).toBe(true)
     expect(maximumActiveTasks).toBe(2)
     releaseRuns.resolve()
-    await expect(Promise.all([first, second])).resolves.toEqual(['connection-1', 'connection-2'])
+    await expect(Promise.all([first.result, second.result])).resolves.toEqual(['connection-1', 'connection-2'])
   })
 
   test('clears a failed flight so a later trigger can retry', async () => {
@@ -123,9 +131,39 @@ describe('KeyedSingleFlight', () => {
       return 'delivered'
     })
 
-    await expect(singleFlight.schedule('connection-1')).rejects.toThrow('delivery failed')
+    await expect(singleFlight.schedule('connection-1').result).rejects.toThrow('delivery failed')
 
     shouldFail = false
-    await expect(singleFlight.schedule('connection-1')).resolves.toBe('delivered')
+    await expect(singleFlight.schedule('connection-1').result).resolves.toBe('delivered')
+  })
+
+  test('does not start a follow-up deadline before the follow-up run starts', async () => {
+    const firstRunStarted = deferred()
+    const releaseFirstRun = deferred()
+    let taskCalls = 0
+
+    const singleFlight = new KeyedSingleFlight(async () => {
+      taskCalls += 1
+      if (taskCalls === 1) {
+        firstRunStarted.resolve()
+        await releaseFirstRun.promise
+      }
+      return taskCalls
+    })
+
+    singleFlight.schedule('connection-1')
+    await firstRunStarted.promise
+    const followUp = singleFlight.schedule('connection-1')
+
+    let followUpStarted = false
+    void followUp.started.then(() => {
+      followUpStarted = true
+    })
+    await Promise.resolve()
+    expect(followUpStarted).toBe(false)
+
+    releaseFirstRun.resolve()
+    await followUp.started
+    expect(followUpStarted).toBe(true)
   })
 })

@@ -4,10 +4,21 @@ interface Deferred<Result> {
   resolve: (result: Result | PromiseLike<Result>) => void
 }
 
+interface FlightRun<Result> {
+  result: Deferred<Result>
+  started: Deferred<void>
+}
+
 interface FlightState<Result> {
-  current: Deferred<Result>
-  next?: Deferred<Result>
+  current: FlightRun<Result>
+  next?: FlightRun<Result>
   started: boolean
+}
+
+export interface ScheduledFlight<Result> {
+  isOwner: boolean
+  result: Promise<Result>
+  started: Promise<void>
 }
 
 function deferred<Result>(): Deferred<Result> {
@@ -21,29 +32,40 @@ function deferred<Result>(): Deferred<Result> {
   return { promise, reject, resolve }
 }
 
+function createRun<Result>(): FlightRun<Result> {
+  return { result: deferred<Result>(), started: deferred<void>() }
+}
+
+function scheduledFlight<Result>(run: FlightRun<Result>, isOwner: boolean): ScheduledFlight<Result> {
+  return { isOwner, result: run.result.promise, started: run.started.promise }
+}
+
 /**
  * Runs at most one task per key at a time. Triggers received while a task is
  * running are coalesced into one follow-up run, preventing both concurrent
- * delivery and a lost wake-up when a new queue item arrives mid-delivery.
+ * delivery and a lost wake-up when a new queue item arrives mid-delivery. Each
+ * run elects one owner for result side effects and exposes when that run starts
+ * so queued follow-up deadlines do not begin prematurely.
  */
 export class KeyedSingleFlight<Key, Result> {
   private readonly flights = new Map<Key, FlightState<Result>>()
 
   public constructor(private readonly task: (key: Key) => Promise<Result>) {}
 
-  public schedule(key: Key): Promise<Result> {
+  public schedule(key: Key): ScheduledFlight<Result> {
     const existingFlight = this.flights.get(key)
     if (existingFlight) {
       // Calls made before the task starts are part of the same burst and need
       // only one queue drain. Calls made during a drain share one follow-up and
       // receive that follow-up's result rather than the current run's result.
-      if (!existingFlight.started) return existingFlight.current.promise
+      if (!existingFlight.started) return scheduledFlight(existingFlight.current, false)
 
-      existingFlight.next ??= deferred<Result>()
-      return existingFlight.next.promise
+      const isOwner = existingFlight.next === undefined
+      existingFlight.next ??= createRun<Result>()
+      return scheduledFlight(existingFlight.next, isOwner)
     }
 
-    const current = deferred<Result>()
+    const current = createRun<Result>()
     const flight: FlightState<Result> = { current, started: false }
     this.flights.set(key, flight)
 
@@ -53,17 +75,18 @@ export class KeyedSingleFlight<Key, Result> {
     queueMicrotask(() => {
       void this.drain(key, flight)
     })
-    return current.promise
+    return scheduledFlight(current, true)
   }
 
   private async drain(key: Key, flight: FlightState<Result>): Promise<void> {
     try {
       flight.started = true
       while (true) {
+        flight.current.started.resolve()
         try {
-          flight.current.resolve(await this.task(key))
+          flight.current.result.resolve(await this.task(key))
         } catch (error) {
-          flight.current.reject(error)
+          flight.current.result.reject(error)
         }
 
         if (!flight.next) return
