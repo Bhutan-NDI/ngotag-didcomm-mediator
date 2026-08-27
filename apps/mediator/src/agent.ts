@@ -37,7 +37,7 @@ import {
   tryExtractJweFp,
   tryExtractRecipientKeyShort,
 } from './logger/StructuredLogger.js'
-import { CoordinatedMediatorService } from './message-delivery/CoordinatedMediatorService.js'
+import { resolveCredoMessageForwardingStrategy } from './message-delivery/resolveCredoMessageForwardingStrategy.js'
 import { StorageServiceMessageQueue } from './storage/StorageMessageQueue.js'
 import { InstrumentedHttpOutboundTransport } from './transports/InstrumentedHttpOutboundTransport.js'
 import { InstrumentedTransportService } from './transports/InstrumentedTransportService.js'
@@ -76,7 +76,14 @@ async function createModules({
       },
       mediator: {
         autoAcceptMediationRequests: true,
-        messageForwardingStrategy: config.messagePickup.forwardingStrategy,
+        // With Redis multi-instance delivery, the Redis queue listener is the
+        // single owner of live delivery and fallback. Configuring Credo to
+        // queue only avoids a second, concurrent queue drain while preserving
+        // the application's QueueAndLiveModeDelivery behaviour.
+        messageForwardingStrategy: resolveCredoMessageForwardingStrategy({
+          configuredStrategy: config.messagePickup.forwardingStrategy,
+          multiInstanceDeliveryType: config.messagePickup.multiInstanceDelivery.type,
+        }),
       },
 
       // Protocols not needed for mediator
@@ -217,13 +224,8 @@ export async function createAgent() {
     modules: modules as typeof modules & { askar: AskarModule },
   })
 
-  // Credo owns local live delivery after queueing a forwarded message. Marking
-  // that path lets the Redis queue listener avoid issuing the same delivery in
-  // parallel. The instrumented implementation extends this service.
-  agent.dependencyManager.registerSingleton(DidCommMediatorService, CoordinatedMediatorService)
-
   if (instrumentationEnabled) {
-    // Register instrumented subclasses for two Credo singletons, to capture the
+    // Override two Credo singletons with instrumented subclasses, to capture the
     // forward-delivery signals that no event/outbound-transport hook can see:
     //   - DidCommTransportService → wraps session.send for the LIVE delivery path
     //     (DirectDelivery's sendPackage uses session.send directly, bypassing

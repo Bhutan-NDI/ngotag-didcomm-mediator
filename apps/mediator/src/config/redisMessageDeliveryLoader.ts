@@ -4,10 +4,14 @@ import Redis from 'ioredis'
 import type { MediatorAgent } from '../agent.js'
 import { config } from '../config.js'
 import { DidcommMessageQueuedEvent, MediatorEventTypes } from '../events.js'
-import { getForwardDeliveryCompletion } from '../message-delivery/forwardDeliveryContext.js'
 import { KeyedSingleFlight } from '../message-delivery/KeyedSingleFlight.js'
+import { settleWithin } from '../message-delivery/settleWithin.js'
 import { RedisStreamMessagePublishing } from '../multi-instance/redis-stream-message-publishing/redisStreamMessagePublishing.js'
 import { sendNotification } from '../push-notifications/sendNotification.js'
+
+// Match the Redis pending-message failover window. A timed-out delivery remains
+// serialized by KeyedSingleFlight; only the push fallback proceeds.
+const LOCAL_DELIVERY_TIMEOUT_MS = 60_000
 
 /**
  * Initialize redis message publishing for queued mediator messages. This message publishing implementation is not
@@ -77,24 +81,17 @@ export async function loadRedisMessageDelivery({
     )
 
     if (config.messagePickup.forwardingStrategy !== DidCommMessageForwardingStrategy.DirectDelivery) {
-      // In QueueAndLiveModeDelivery, Credo's processForwardMessage queues the
-      // message before attempting local delivery. Wait for that attempt before
-      // draining again so both paths never read and send the same queue item in
-      // parallel. The follow-up drain also preserves the normal remote-server
-      // and push-notification fallback if the local session disappears before
-      // Credo reaches its delivery check.
-      const forwardDeliveryCompletion = getForwardDeliveryCompletion()
-      if (
-        config.messagePickup.forwardingStrategy === DidCommMessageForwardingStrategy.QueueAndLiveModeDelivery &&
-        forwardDeliveryCompletion
-      ) {
-        agent.config.logger.debug('Waiting for Credo forward delivery before handling the queued-message event.', {
-          connectionId,
-        })
-        await forwardDeliveryCompletion
+      const delivery = await settleWithin(localDelivery.schedule(connectionId), LOCAL_DELIVERY_TIMEOUT_MS)
+
+      if (delivery.status === 'completed' && delivery.value) {
+        return
       }
 
-      if (await localDelivery.schedule(connectionId)) {
+      if (delivery.status === 'timed-out') {
+        agent.config.logger.debug('Local queued-message delivery timed out. Falling back to push notification.', {
+          connectionId,
+        })
+        await sendNotification(agent.context, connectionId)
         return
       }
     }
@@ -156,10 +153,23 @@ export async function loadRedisMessageDelivery({
         `Server '${streamPublishing.serverId}' received message ${message.id} for connection '${message.payload.connectionId}'. Attempting to deliver to local session.`
       )
 
-      if (await localDelivery.schedule(message.payload.connectionId)) {
+      const delivery = await settleWithin(
+        localDelivery.schedule(message.payload.connectionId),
+        LOCAL_DELIVERY_TIMEOUT_MS
+      )
+
+      if (delivery.status === 'completed' && delivery.value) {
         // We delivered the messages, so no push notification is needed. If
         // several stream entries target this connection, they share this
         // flight and at most one follow-up queue drain is scheduled.
+        return
+      }
+
+      if (delivery.status === 'timed-out') {
+        agent.config.logger.debug(
+          `Local delivery timed out for connection '${message.payload.connectionId}'. Falling back to push notification without starting another delivery attempt.`
+        )
+        await sendNotification(agent.context, message.payload.connectionId)
         return
       }
 
