@@ -1,3 +1,4 @@
+import { DidCommMessagePickupEventTypes } from '@credo-ts/didcomm'
 import { describe, expect, test, vi } from 'vitest'
 import { RedisStreamMessagePublishing } from './redisStreamMessagePublishing.js'
 
@@ -11,6 +12,76 @@ function deferred() {
 }
 
 describe('RedisStreamMessagePublishing', () => {
+  test('waits for live-session registration before the event handler completes', async () => {
+    const registration = deferred()
+    const handlers = new Map<string, (event: never) => Promise<void>>()
+    const logger = {
+      debug: vi.fn(),
+      error: vi.fn(),
+      info: vi.fn(),
+    }
+    const agent = {
+      config: { logger },
+      context: { config: { logger } },
+      events: {
+        on: vi.fn((eventType: string, handler: (event: never) => Promise<void>) => {
+          handlers.set(eventType, handler)
+        }),
+      },
+    }
+    const client = {
+      setex: vi.fn().mockImplementation(() => registration.promise),
+    }
+    new RedisStreamMessagePublishing(agent as never, client as never, 'server-1')
+
+    const savedHandler = handlers.get(DidCommMessagePickupEventTypes.LiveSessionSaved)
+    expect(savedHandler).toBeDefined()
+
+    let handlerCompleted = false
+    const handling = savedHandler?.({ payload: { session: { connectionId: 'connection-1' } } } as never).then(() => {
+      handlerCompleted = true
+    })
+    await Promise.resolve()
+
+    expect(handlerCompleted).toBe(false)
+    expect(client.setex).toHaveBeenCalledWith('connection:connection-1', 3600, 'server-1')
+
+    registration.resolve()
+    await handling
+    expect(handlerCompleted).toBe(true)
+  })
+
+  test('catches a failed live-session registration in the event handler', async () => {
+    const registrationError = new Error('redis unavailable')
+    const handlers = new Map<string, (event: never) => Promise<void>>()
+    const logger = {
+      debug: vi.fn(),
+      error: vi.fn(),
+      info: vi.fn(),
+    }
+    const agent = {
+      config: { logger },
+      context: { config: { logger } },
+      events: {
+        on: vi.fn((eventType: string, handler: (event: never) => Promise<void>) => {
+          handlers.set(eventType, handler)
+        }),
+      },
+    }
+    const client = {
+      setex: vi.fn().mockRejectedValue(registrationError),
+    }
+    new RedisStreamMessagePublishing(agent as never, client as never, 'server-1')
+
+    const savedHandler = handlers.get(DidCommMessagePickupEventTypes.LiveSessionSaved)
+    expect(savedHandler).toBeDefined()
+
+    await expect(
+      savedHandler?.({ payload: { session: { connectionId: 'connection-1' } } } as never)
+    ).resolves.toBeUndefined()
+    expect(logger.error).toHaveBeenCalledWith(`Error handling LiveSessionSaved: ${registrationError}`)
+  })
+
   test('processes a read batch concurrently and acknowledges every successful entry', async () => {
     const abortController = new AbortController()
     const bothHandlersStarted = deferred()

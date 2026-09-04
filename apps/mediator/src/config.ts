@@ -6,6 +6,7 @@ import { loadConfigSync } from 'zod-config'
 import { envAdapter } from 'zod-config/env-adapter'
 import { jsonAdapter } from 'zod-config/json-adapter'
 import { Logger } from './logger/index.js'
+import { resolveCredoMessageForwardingStrategy } from './message-delivery/resolveCredoMessageForwardingStrategy.js'
 
 const zFirebaseProjects = z.array(
   z.object({
@@ -401,6 +402,11 @@ const zConfig = z
 
 export type Config = z.infer<typeof zConfig>
 export const config = loadMediatorConfig()
+export const configuredMessageForwardingStrategy = config.messagePickup.forwardingStrategy
+export const effectiveCredoMessageForwardingStrategy = resolveCredoMessageForwardingStrategy({
+  configuredStrategy: configuredMessageForwardingStrategy,
+  multiInstanceDeliveryType: config.messagePickup.multiInstanceDelivery.type,
+})
 export const logger = new Logger(LogLevel[config.logLevel])
 
 function loadMediatorConfig(): Config {

@@ -1,4 +1,7 @@
-export type SettledWithin<Result> = { status: 'completed'; value: Result } | { status: 'timed-out' }
+export type SettledWithin<Result> =
+  | { status: 'completed'; value: Result }
+  | { status: 'errored'; error: unknown }
+  | { status: 'timed-out' }
 
 /**
  * Observe an operation for a bounded period without cancelling it. This lets a
@@ -16,7 +19,10 @@ export async function settleWithin<Result>(
 
   try {
     return await Promise.race([
-      operation.then((value): SettledWithin<Result> => ({ status: 'completed', value })),
+      operation.then(
+        (value): SettledWithin<Result> => ({ status: 'completed', value }),
+        (error): SettledWithin<Result> => ({ status: 'errored', error })
+      ),
       timedOut,
     ])
   } finally {

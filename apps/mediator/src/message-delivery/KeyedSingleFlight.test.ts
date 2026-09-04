@@ -29,6 +29,8 @@ describe('KeyedSingleFlight', () => {
     expect(third.isOwner).toBe(false)
     expect(second.result).toBe(first.result)
     expect(third.result).toBe(first.result)
+    expect(second.flightId).toBe(first.flightId)
+    expect(third.flightId).toBe(first.flightId)
     await expect(first.result).resolves.toBe(1)
     expect(taskCalls).toBe(1)
   })
@@ -64,6 +66,8 @@ describe('KeyedSingleFlight', () => {
     expect(third.isOwner).toBe(false)
     expect(second.result).not.toBe(first.result)
     expect(third.result).toBe(second.result)
+    expect(second.flightId).toBe(first.flightId)
+    expect(third.flightId).toBe(first.flightId)
 
     releaseFirstRun.resolve()
     await expect(first.result).resolves.toBe(1)
@@ -131,10 +135,13 @@ describe('KeyedSingleFlight', () => {
       return 'delivered'
     })
 
-    await expect(singleFlight.schedule('connection-1').result).rejects.toThrow('delivery failed')
+    const failed = singleFlight.schedule('connection-1')
+    await expect(failed.result).rejects.toThrow('delivery failed')
 
     shouldFail = false
-    await expect(singleFlight.schedule('connection-1').result).resolves.toBe('delivered')
+    const retry = singleFlight.schedule('connection-1')
+    expect(retry.flightId).not.toBe(failed.flightId)
+    await expect(retry.result).resolves.toBe('delivered')
   })
 
   test('does not start a follow-up deadline before the follow-up run starts', async () => {

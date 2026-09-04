@@ -14,7 +14,9 @@ describe('resolveCredoMessageForwardingStrategy', () => {
 
   test.each([
     [DidCommMessageForwardingStrategy.QueueAndLiveModeDelivery, 'none'],
+    [DidCommMessageForwardingStrategy.QueueOnly, 'none'],
     [DidCommMessageForwardingStrategy.QueueOnly, 'redis'],
+    [DidCommMessageForwardingStrategy.DirectDelivery, 'none'],
     [DidCommMessageForwardingStrategy.DirectDelivery, 'redis'],
   ] as const)('preserves %s with %s multi-instance delivery', (configuredStrategy, multiInstanceDeliveryType) => {
     expect(resolveCredoMessageForwardingStrategy({ configuredStrategy, multiInstanceDeliveryType })).toBe(

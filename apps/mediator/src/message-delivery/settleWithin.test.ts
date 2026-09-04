@@ -34,4 +34,13 @@ describe('settleWithin', () => {
     operation.resolve(true)
     await expect(operation.promise).resolves.toBe(true)
   })
+
+  test('returns an error outcome instead of rejecting', async () => {
+    const error = new Error('delivery failed')
+
+    await expect(settleWithin(Promise.reject(error), 60_000)).resolves.toEqual({
+      status: 'errored',
+      error,
+    })
+  })
 })

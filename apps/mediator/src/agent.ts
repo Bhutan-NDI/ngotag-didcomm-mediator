@@ -23,7 +23,12 @@ import { ExtendedQueueTransportRepository, loadMessagePickupStorage } from './co
 import { loadPushNotificationSender } from './config/pushNotificationLoader.js'
 import { loadRedisMessageDelivery } from './config/redisMessageDeliveryLoader.js'
 import { loadStorage } from './config/storageLoader.js'
-import { config, logger } from './config.js'
+import {
+  config,
+  configuredMessageForwardingStrategy,
+  effectiveCredoMessageForwardingStrategy,
+  logger,
+} from './config.js'
 import { registerAdminEndpoints } from './instrumentation/adminEndpoint.js'
 import { wireEventInstrumentation } from './instrumentation/eventInstrumentation.js'
 import { startGauges } from './instrumentation/gauges.js'
@@ -37,7 +42,6 @@ import {
   tryExtractJweFp,
   tryExtractRecipientKeyShort,
 } from './logger/StructuredLogger.js'
-import { resolveCredoMessageForwardingStrategy } from './message-delivery/resolveCredoMessageForwardingStrategy.js'
 import { StorageServiceMessageQueue } from './storage/StorageMessageQueue.js'
 import { InstrumentedHttpOutboundTransport } from './transports/InstrumentedHttpOutboundTransport.js'
 import { InstrumentedTransportService } from './transports/InstrumentedTransportService.js'
@@ -80,10 +84,7 @@ async function createModules({
         // single owner of live delivery and fallback. Configuring Credo to
         // queue only avoids a second, concurrent queue drain while preserving
         // the application's QueueAndLiveModeDelivery behaviour.
-        messageForwardingStrategy: resolveCredoMessageForwardingStrategy({
-          configuredStrategy: config.messagePickup.forwardingStrategy,
-          multiInstanceDeliveryType: config.messagePickup.multiInstanceDelivery.type,
-        }),
+        messageForwardingStrategy: effectiveCredoMessageForwardingStrategy,
       },
 
       // Protocols not needed for mediator
@@ -155,6 +156,13 @@ export async function createAgent() {
   // Master switch — when off, none of the instrumentation below is wired and the
   // mediator runs the stock components (see config.instrumentationEnabled).
   const instrumentationEnabled = config.instrumentationEnabled
+
+  if (configuredMessageForwardingStrategy !== effectiveCredoMessageForwardingStrategy) {
+    logger.warn('Redis multi-instance delivery is taking ownership of live queued-message delivery.', {
+      configuredMessageForwardingStrategy,
+      effectiveCredoMessageForwardingStrategy,
+    })
+  }
 
   if (instrumentationEnabled) {
     // Runtime log-level toggle endpoint (no-op unless ADMIN_TOKEN is set).
@@ -327,11 +335,8 @@ export async function createAgent() {
       notes: 'effective config at startup',
       instrumentation_enabled: true,
       log_level: config.logLevel,
-      message_forwarding_strategy: resolveCredoMessageForwardingStrategy({
-        configuredStrategy: config.messagePickup.forwardingStrategy,
-        multiInstanceDeliveryType: config.messagePickup.multiInstanceDelivery.type,
-      }),
-      configured_message_forwarding_strategy: config.messagePickup.forwardingStrategy,
+      message_forwarding_strategy: effectiveCredoMessageForwardingStrategy,
+      configured_message_forwarding_strategy: configuredMessageForwardingStrategy,
       message_pickup_storage: config.messagePickup.storage.type,
       multi_instance_delivery: config.messagePickup.multiInstanceDelivery.type,
       cache_type: config.cache.type,

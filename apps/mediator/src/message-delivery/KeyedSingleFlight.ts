@@ -11,11 +11,13 @@ interface FlightRun<Result> {
 
 interface FlightState<Result> {
   current: FlightRun<Result>
+  id: object
   next?: FlightRun<Result>
   started: boolean
 }
 
 export interface ScheduledFlight<Result> {
+  flightId: object
   isOwner: boolean
   result: Promise<Result>
   started: Promise<void>
@@ -36,8 +38,12 @@ function createRun<Result>(): FlightRun<Result> {
   return { result: deferred<Result>(), started: deferred<void>() }
 }
 
-function scheduledFlight<Result>(run: FlightRun<Result>, isOwner: boolean): ScheduledFlight<Result> {
-  return { isOwner, result: run.result.promise, started: run.started.promise }
+function scheduledFlight<Result>(
+  flight: FlightState<Result>,
+  run: FlightRun<Result>,
+  isOwner: boolean
+): ScheduledFlight<Result> {
+  return { flightId: flight.id, isOwner, result: run.result.promise, started: run.started.promise }
 }
 
 /**
@@ -58,15 +64,15 @@ export class KeyedSingleFlight<Key, Result> {
       // Calls made before the task starts are part of the same burst and need
       // only one queue drain. Calls made during a drain share one follow-up and
       // receive that follow-up's result rather than the current run's result.
-      if (!existingFlight.started) return scheduledFlight(existingFlight.current, false)
+      if (!existingFlight.started) return scheduledFlight(existingFlight, existingFlight.current, false)
 
       const isOwner = existingFlight.next === undefined
       existingFlight.next ??= createRun<Result>()
-      return scheduledFlight(existingFlight.next, isOwner)
+      return scheduledFlight(existingFlight, existingFlight.next, isOwner)
     }
 
     const current = createRun<Result>()
-    const flight: FlightState<Result> = { current, started: false }
+    const flight: FlightState<Result> = { current, id: {}, started: false }
     this.flights.set(key, flight)
 
     // Start in the next microtask so a synchronous burst for one key collapses
@@ -75,7 +81,7 @@ export class KeyedSingleFlight<Key, Result> {
     queueMicrotask(() => {
       void this.drain(key, flight)
     })
-    return scheduledFlight(current, true)
+    return scheduledFlight(flight, current, true)
   }
 
   private async drain(key: Key, flight: FlightState<Result>): Promise<void> {

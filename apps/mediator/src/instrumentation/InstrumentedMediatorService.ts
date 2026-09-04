@@ -8,7 +8,7 @@ import {
   DidCommMediatorService,
 } from '@credo-ts/didcomm'
 
-import { config } from '../config.js'
+import { effectiveCredoMessageForwardingStrategy } from '../config.js'
 import {
   durationMs,
   emitStructured,
@@ -17,7 +17,6 @@ import {
   truncateKey,
   tryExtractJweFp,
 } from '../logger/StructuredLogger.js'
-import { resolveCredoMessageForwardingStrategy } from '../message-delivery/resolveCredoMessageForwardingStrategy.js'
 
 // Instruments the mediator forward path directly, because the underlying
 // delivery (DidCommMessageSender.sendPackage for DirectDelivery, or the pickup
@@ -75,10 +74,7 @@ export class InstrumentedMediatorService extends DidCommMediatorService {
       span_id: spanId,
       jwe_fp: jweFp,
       recipient_key_short: recipientKeyShort,
-      decision: resolveCredoMessageForwardingStrategy({
-        configuredStrategy: config.messagePickup.forwardingStrategy,
-        multiInstanceDeliveryType: config.messagePickup.multiInstanceDelivery.type,
-      }),
+      decision: effectiveCredoMessageForwardingStrategy,
     })
 
     try {
