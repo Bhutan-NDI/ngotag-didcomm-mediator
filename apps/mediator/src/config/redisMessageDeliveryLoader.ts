@@ -2,10 +2,21 @@ import { randomUUID } from 'node:crypto'
 import { DidCommMessageForwardingStrategy, DidCommMessagePickupSessionRole } from '@credo-ts/didcomm'
 import Redis from 'ioredis'
 import type { MediatorAgent } from '../agent.js'
-import { config } from '../config.js'
+import { config, configuredMessageForwardingStrategy } from '../config.js'
 import { DidcommMessageQueuedEvent, MediatorEventTypes } from '../events.js'
+import {
+  type DeliveryFallbackReason,
+  QueuedMessageDeliveryCoordinator,
+} from '../message-delivery/QueuedMessageDeliveryCoordinator.js'
+import { routeQueuedMessageFallback } from '../message-delivery/routeQueuedMessageFallback.js'
 import { RedisStreamMessagePublishing } from '../multi-instance/redis-stream-message-publishing/redisStreamMessagePublishing.js'
 import { sendNotification } from '../push-notifications/sendNotification.js'
+
+// Bound local work from event arrival and leave time for routing/notification
+// plus stream acknowledgement before another server may reclaim the entry.
+const LOCAL_DELIVERY_TIMEOUT_MS = 45_000
+const MESSAGE_HANDLING_TIMEOUT_MS = 55_000
+const PENDING_MESSAGE_FAILOVER_MS = 60_000
 
 /**
  * Initialize redis message publishing for queued mediator messages. This message publishing implementation is not
@@ -45,6 +56,41 @@ export async function loadRedisMessageDelivery({
   // if a server crashes we lose the active socket connections.
   const streamPublishing = new RedisStreamMessagePublishing(agent, client, randomUUID())
 
+  const routeOrNotify = (connectionId: string, reason?: DeliveryFallbackReason) =>
+    routeQueuedMessageFallback({
+      connectionId,
+      logger: agent.config.logger,
+      notify: (fallbackConnectionId) => sendNotification(agent.context, fallbackConnectionId),
+      reason,
+      routing: streamPublishing,
+    })
+
+  const deliveryCoordinator = new QueuedMessageDeliveryCoordinator(
+    async (connectionId: string): Promise<boolean> => {
+      try {
+        const session = await agent.didcomm.messagePickup.getLiveModeSession({
+          connectionId,
+          role: DidCommMessagePickupSessionRole.MessageHolder,
+        })
+
+        if (!session) return false
+
+        agent.config.logger.debug('Found a local session. Delivering messages from queue.', { connectionId })
+        await agent.didcomm.messagePickup.deliverMessagesFromQueue({
+          pickupSessionId: session.id,
+        })
+        agent.config.logger.debug('Successfully delivered queued messages to a local session.', { connectionId })
+        return true
+      } catch (error) {
+        agent.config.logger.debug('Unable to deliver queued messages to a local session.', { connectionId, error })
+        return false
+      }
+    },
+    routeOrNotify,
+    LOCAL_DELIVERY_TIMEOUT_MS,
+    MESSAGE_HANDLING_TIMEOUT_MS
+  )
+
   agent.events.on<DidcommMessageQueuedEvent>(MediatorEventTypes.DidCommMessageQueued, async (event) => {
     const connectionId = event.payload.connectionId
 
@@ -52,81 +98,12 @@ export async function loadRedisMessageDelivery({
       `Server ${streamPublishing.serverId} received DidCommMessageQuedEvent for connection ${connectionId}`
     )
 
-    // TODO: do we want to handle when we don't want to send to local sessions?
-    if (config.messagePickup.forwardingStrategy !== DidCommMessageForwardingStrategy.DirectDelivery) {
-      agent.config.logger.debug(
-        'Trying to send queued message to session directly, since forwarding strategy is set to QueueOnly',
-        { connectionId }
-      )
-      try {
-        const session = await agent.didcomm.messagePickup.getLiveModeSession({
-          connectionId,
-          role: DidCommMessagePickupSessionRole.MessageHolder,
-        })
-
-        if (session) {
-          agent.config.logger.debug(
-            'Found a local session to send queued message to session directly. Delivering messages from queue',
-            { connectionId }
-          )
-          await agent.didcomm.messagePickup.deliverMessagesFromQueue({
-            pickupSessionId: session.id,
-          })
-
-          agent.config.logger.debug(
-            'Found a local session to send queued message to session directly. Delivering messages from queue',
-            { connectionId }
-          )
-
-          // We succeeded in delivering the message. We can return
-          return
-        }
-
-        // We didn't send the message yet, we need to check other instances
-      } catch (_error) {
-        agent.config.logger.debug(
-          // In case of an error we didn't send the message yet, we need to check other instances
-          'An error occurred while retrieving or sending queued messages to a local session. Continuing with other servers or falling back to sending a push notifications.',
-          { connectionId }
-        )
-      }
+    if (configuredMessageForwardingStrategy !== DidCommMessageForwardingStrategy.DirectDelivery) {
+      await deliveryCoordinator.schedule(connectionId)
+      return
     }
 
-    // Try finding another server to send the message to
-    const serverId = await streamPublishing.getConnectionServer(connectionId)
-
-    if (serverId) {
-      // Special case. Usually this won't happen because then the above code would already have
-      // handled it. So it means the session was closed, but not removed from redis. We remove it
-      // and will send a push notification
-      if (serverId === streamPublishing.serverId) {
-        agent.config.logger.debug(
-          `Found own server '${serverId}' in redis for connection '${connectionId}'. Unregistering connection from redis, since we already tried sending to local session.`
-        )
-
-        await streamPublishing.unregisterConnection(connectionId).catch(() => {})
-      } else {
-        try {
-          agent.config.logger.debug(
-            `Found server '${serverId}' in redis for connection '${connectionId}'. Sending message to server over redis stream.`
-          )
-
-          await streamPublishing.sendMessageToServer(serverId, {
-            connectionId,
-          })
-          return
-        } catch {
-          // If it fails, we will just send a push notification
-          agent.config.logger.debug(
-            `Error sending message to server '${serverId}' for connection '${connectionId}'. Falling back to push notification sending`
-          )
-        }
-      }
-    } else {
-      agent.config.logger.debug(`No server with active delivery session found for connection ${connectionId}`)
-    }
-
-    await sendNotification(agent.context, connectionId)
+    await routeOrNotify(connectionId)
   })
 
   // We want to send a push notification for all messages that were emitted on the stream but not handled
@@ -139,7 +116,7 @@ export async function loadRedisMessageDelivery({
 
       await sendNotification(agent.context, message.payload.connectionId)
     },
-    { signal: abortSignal }
+    { minIdleTimeMs: PENDING_MESSAGE_FAILOVER_MS, signal: abortSignal }
   )
 
   // First we want to try to send the message to an open socket connection. If that's not possible, we will emit a push notification.
@@ -149,43 +126,7 @@ export async function loadRedisMessageDelivery({
         `Server '${streamPublishing.serverId}' received message ${message.id} for connection '${message.payload.connectionId}'. Attempting to deliver to local session.`
       )
 
-      const pickupSession = await agent.didcomm.messagePickup.getLiveModeSession({
-        connectionId: message.payload.connectionId,
-        role: DidCommMessagePickupSessionRole.MessageHolder,
-      })
-
-      if (pickupSession) {
-        try {
-          agent.config.logger.debug(
-            `Found local session for connection '${message.payload.connectionId}'. Delivering messages from queue.`
-          )
-
-          await agent.didcomm.messagePickup.deliverMessagesFromQueue({
-            pickupSessionId: pickupSession.id,
-          })
-
-          agent.config.logger.debug(
-            `Successfully delivered messages to local session for connection '${message.payload.connectionId}' for message ${message.id}`
-          )
-
-          // We delivered the messages, we don't have to send a push notification
-          // Improvement: If we haven't received an ack in X seconds, we should still
-          // send the push notification
-          return
-        } catch (error) {
-          // In case an error occurred with the delivery of the message, we will send a push notification
-          agent.config.logger.debug(
-            `Error delivering message ${message.id} to local session for connection '${message.payload.connectionId}'. Falling back to push notification.`,
-            { error }
-          )
-        }
-      } else {
-        agent.config.logger.debug(
-          `No local session found for connection '${message.payload.connectionId}'. Falling back to push notification.`
-        )
-      }
-
-      await sendNotification(agent.context, message.payload.connectionId)
+      await deliveryCoordinator.schedule(message.payload.connectionId, message.createdAt)
     },
     { signal: abortSignal }
   )
