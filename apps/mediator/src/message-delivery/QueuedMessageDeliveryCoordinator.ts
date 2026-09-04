@@ -27,12 +27,13 @@ export class QueuedMessageDeliveryCoordinator<Key> {
 
   /**
    * Schedule one serialized delivery run for a key. Local delivery is bounded
-   * from this call, including time queued behind a predecessor, and fallback is
-   * bounded by the overall completion deadline. Non-owners share the owner's
-   * delivery and fallback side effects.
+   * from the trigger timestamp, including time queued before processing or
+   * behind a predecessor, and fallback is bounded by the overall completion
+   * deadline. Non-owners share the owner's delivery and fallback side effects.
    */
   public async schedule(key: Key, triggeredAt = Date.now()): Promise<void> {
-    const startedAt = Math.min(triggeredAt, Date.now())
+    const now = Date.now()
+    const startedAt = Number.isFinite(triggeredAt) ? Math.min(triggeredAt, now) : now
     const deliveryDeadline = startedAt + this.deliveryTimeoutMs
     const completionDeadline = startedAt + this.completionTimeoutMs
 
