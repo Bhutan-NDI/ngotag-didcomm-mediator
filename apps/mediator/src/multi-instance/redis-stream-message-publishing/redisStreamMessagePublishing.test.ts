@@ -88,6 +88,7 @@ describe('RedisStreamMessagePublishing', () => {
     const releaseHandlers = deferred()
     let activeHandlers = 0
     let maximumActiveHandlers = 0
+    const createdAtById = new Map<string, number>()
 
     const logger = {
       debug: vi.fn(),
@@ -115,7 +116,8 @@ describe('RedisStreamMessagePublishing', () => {
     const publishing = new RedisStreamMessagePublishing(agent as never, client as never, 'server-1')
 
     const listening = publishing.listenForMessages(
-      async () => {
+      async (message) => {
+        createdAtById.set(message.id, message.createdAt)
         activeHandlers += 1
         maximumActiveHandlers = Math.max(maximumActiveHandlers, activeHandlers)
         if (activeHandlers === 2) {
@@ -138,6 +140,12 @@ describe('RedisStreamMessagePublishing', () => {
     expect(client.xack).toHaveBeenCalledTimes(2)
     expect(client.xack).toHaveBeenCalledWith('server:server-1:message-publishing', 'default', '1-0')
     expect(client.xack).toHaveBeenCalledWith('server:server-1:message-publishing', 'default', '2-0')
+    expect(createdAtById).toEqual(
+      new Map([
+        ['1-0', 1],
+        ['2-0', 2],
+      ])
+    )
   })
 
   test('does not let one failed entry block acknowledgement of another entry', async () => {

@@ -126,7 +126,7 @@ export async function loadRedisMessageDelivery({
         `Server '${streamPublishing.serverId}' received message ${message.id} for connection '${message.payload.connectionId}'. Attempting to deliver to local session.`
       )
 
-      await deliveryCoordinator.schedule(message.payload.connectionId)
+      await deliveryCoordinator.schedule(message.payload.connectionId, message.createdAt)
     },
     { signal: abortSignal }
   )

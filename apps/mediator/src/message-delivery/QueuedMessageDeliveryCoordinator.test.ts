@@ -141,4 +141,31 @@ describe('QueuedMessageDeliveryCoordinator', () => {
     await scheduled
     fallbackResult.resolve()
   })
+
+  test('uses the trigger timestamp instead of restarting the delivery window when processing is delayed', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(100_000)
+    const deliver = vi.fn().mockResolvedValue(true)
+    const fallback = vi.fn().mockResolvedValue(undefined)
+    const coordinator = new QueuedMessageDeliveryCoordinator(deliver, fallback, 45_000, 55_000)
+
+    await coordinator.schedule('connection-1', 50_000)
+
+    expect(deliver).not.toHaveBeenCalled()
+    expect(fallback).toHaveBeenCalledWith('connection-1', { status: 'timed-out' })
+  })
+
+  test('leaves an entry unhandled when its overall deadline elapsed before processing', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(100_000)
+    const deliver = vi.fn().mockResolvedValue(true)
+    const fallback = vi.fn().mockResolvedValue(undefined)
+    const coordinator = new QueuedMessageDeliveryCoordinator(deliver, fallback, 45_000, 55_000)
+
+    await expect(coordinator.schedule('connection-1', 45_000)).rejects.toThrow(
+      'Queued message delivery deadline elapsed before processing'
+    )
+    expect(deliver).not.toHaveBeenCalled()
+    expect(fallback).not.toHaveBeenCalled()
+  })
 })

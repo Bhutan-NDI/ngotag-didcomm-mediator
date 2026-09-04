@@ -11,6 +11,7 @@ export interface StreamMessagePayload {
 }
 
 export interface StreamMessage {
+  createdAt: number
   id: string
   payload: StreamMessagePayload
 }
@@ -190,6 +191,7 @@ export class RedisStreamMessagePublishing {
         let streamMessage: StreamMessage
         try {
           streamMessage = {
+            createdAt: this.getStreamMessageTimestamp(responseMessage[0]),
             id: responseMessage[0],
             payload: JSON.parse(responseMessage[1][1]),
           }
@@ -205,6 +207,11 @@ export class RedisStreamMessagePublishing {
     }
 
     return messages
+  }
+
+  private getStreamMessageTimestamp(messageId: string): number {
+    const timestamp = Number(messageId.split('-', 1)[0])
+    return Number.isSafeInteger(timestamp) && timestamp >= 0 ? timestamp : Date.now()
   }
 
   /**
