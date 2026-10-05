@@ -36,10 +36,19 @@ export async function routeQueuedMessageFallback({
   const serverId = await routing.getConnectionServer(connectionId)
 
   if (serverId === routing.serverId) {
-    logger.debug(
-      `Found own server '${serverId}' in redis for connection '${connectionId}'. Unregistering the stale local connection before sending a push notification.`
-    )
-    await routing.unregisterConnection(connectionId).catch(() => {})
+    // A timed-out drain may still be running against an open socket, so the
+    // registration is not known to be stale. Keep it so other servers can still
+    // forward here; LiveSessionRemoved clears it if the session has gone.
+    if (reason?.status === 'timed-out') {
+      logger.debug(
+        `Found own server '${serverId}' in redis for connection '${connectionId}'. Keeping the registration while local delivery may still be running, and sending a push notification.`
+      )
+    } else {
+      logger.debug(
+        `Found own server '${serverId}' in redis for connection '${connectionId}'. Unregistering the stale local connection before sending a push notification.`
+      )
+      await routing.unregisterConnection(connectionId).catch(() => {})
+    }
   } else if (serverId) {
     try {
       logger.debug(

@@ -25,7 +25,20 @@ describe('routeQueuedMessageFallback', () => {
     expect(notify).not.toHaveBeenCalled()
   })
 
-  test('clears a stale local registration before sending a notification', async () => {
+  test.each([
+    { status: 'unavailable' } as const,
+    { status: 'errored', error: new Error('send failed') } as const,
+  ])('clears a stale local registration before sending a notification ($status)', async (reason) => {
+    const { logger, notify, routing } = dependencies('server-1')
+
+    await routeQueuedMessageFallback({ connectionId: 'connection-1', logger, notify, reason, routing })
+
+    expect(routing.unregisterConnection).toHaveBeenCalledWith('connection-1')
+    expect(routing.sendMessageToServer).not.toHaveBeenCalled()
+    expect(notify).toHaveBeenCalledWith('connection-1')
+  })
+
+  test('keeps the local registration when local delivery only timed out', async () => {
     const { logger, notify, routing } = dependencies('server-1')
 
     await routeQueuedMessageFallback({
@@ -36,7 +49,9 @@ describe('routeQueuedMessageFallback', () => {
       routing,
     })
 
-    expect(routing.unregisterConnection).toHaveBeenCalledWith('connection-1')
+    // A slow drain may still be running on an open socket; removing the key
+    // would leave other servers sending only push notifications for it.
+    expect(routing.unregisterConnection).not.toHaveBeenCalled()
     expect(routing.sendMessageToServer).not.toHaveBeenCalled()
     expect(notify).toHaveBeenCalledWith('connection-1')
   })
