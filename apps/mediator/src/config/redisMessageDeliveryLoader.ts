@@ -4,6 +4,7 @@ import Redis from 'ioredis'
 import type { MediatorAgent } from '../agent.js'
 import { config, configuredMessageForwardingStrategy } from '../config.js'
 import { DidcommMessageQueuedEvent, MediatorEventTypes } from '../events.js'
+import { handleQueuedMessageEvent } from '../message-delivery/handleQueuedMessageEvent.js'
 import {
   type DeliveryFallbackReason,
   QueuedMessageDeliveryCoordinator,
@@ -98,12 +99,14 @@ export async function loadRedisMessageDelivery({
       `Server ${streamPublishing.serverId} received DidCommMessageQuedEvent for connection ${connectionId}`
     )
 
-    if (configuredMessageForwardingStrategy !== DidCommMessageForwardingStrategy.DirectDelivery) {
-      await deliveryCoordinator.schedule(connectionId)
-      return
-    }
-
-    await routeOrNotify(connectionId)
+    await handleQueuedMessageEvent({
+      connectionId,
+      deliver: (queuedConnectionId) =>
+        configuredMessageForwardingStrategy !== DidCommMessageForwardingStrategy.DirectDelivery
+          ? deliveryCoordinator.schedule(queuedConnectionId)
+          : routeOrNotify(queuedConnectionId),
+      logger: agent.config.logger,
+    })
   })
 
   // We want to send a push notification for all messages that were emitted on the stream but not handled
