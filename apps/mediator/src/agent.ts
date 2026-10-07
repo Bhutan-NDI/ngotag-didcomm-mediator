@@ -4,6 +4,7 @@ import { Agent } from '@credo-ts/core'
 import {
   DidCommMediatorService,
   DidCommMessageReceiver,
+  DidCommMessageSender,
   DidCommMimeType,
   DidCommModule,
   DidCommOutOfBandRole,
@@ -27,6 +28,7 @@ import { wireEventInstrumentation } from './instrumentation/eventInstrumentation
 import { InstrumentedMediatorService } from './instrumentation/InstrumentedMediatorService.js'
 import { InstrumentedMessageReceiver } from './instrumentation/InstrumentedMessageReceiver.js'
 import { InstrumentedQueueTransportRepository } from './instrumentation/InstrumentedQueueTransportRepository.js'
+import { instrumentQueuedDelivery } from './instrumentation/instrumentQueuedDelivery.js'
 import {
   registerDbPoolAccessor,
   registerQueueAccessor,
@@ -35,6 +37,7 @@ import {
 } from './instrumentation/metrics.js'
 import { StorageServiceMessageQueue } from './storage/StorageMessageQueue.js'
 import { registerWebSocketTelemetryContext } from './telemetry/api.js'
+import { closeWebSocketClients } from './transports/closeWebSocketClients.js'
 import { InstrumentedHttpOutboundTransport } from './transports/InstrumentedHttpOutboundTransport.js'
 import { InstrumentedTransportService } from './transports/InstrumentedTransportService.js'
 import { InstrumentedWsOutboundTransport } from './transports/InstrumentedWsOutboundTransport.js'
@@ -95,6 +98,7 @@ function instrumentSocketServer(socketServer: WebSocketServer): void {
 
 interface RuntimeHandles {
   abortController: AbortController
+  closeWebSocketClients: () => Promise<void>
   stopCache: () => Promise<void>
   stopHeartbeat: () => void
   stopQueue: () => Promise<void>
@@ -219,6 +223,11 @@ export async function createAgent() {
   // When an 'upgrade' to WS is made on our http server, we forward the
   // request to the WS server
   inboundTransport?.server?.on('upgrade', (request, socket, head) => {
+    // Refuse new live sessions once shutdown has started, so the WS server can drain.
+    if (abortController.signal.aborted) {
+      socket.destroy()
+      return
+    }
     socketServer.handleUpgrade(request, socket as Socket, head, (socket) => {
       socketServer.emit('connection', socket, request)
     })
@@ -235,6 +244,7 @@ export async function createAgent() {
     registerDbPoolAccessor('pickup', getPoolStats)
   }
   wireEventInstrumentation(agent)
+  instrumentQueuedDelivery(agent.dependencyManager.resolve(DidCommMessageSender))
 
   await loadPushNotificationSender(agent)
   const stopRedisDelivery = await loadRedisMessageDelivery({
@@ -246,6 +256,7 @@ export async function createAgent() {
 
   runtimeHandles.set(agent, {
     abortController,
+    closeWebSocketClients: () => closeWebSocketClients(socketServer),
     stopCache: async () => {
       if (redisClient && redisClient.status !== 'end') await redisClient.quit()
     },
@@ -259,21 +270,30 @@ export async function createAgent() {
 
 export async function shutdownAgent(agent: Agent): Promise<void> {
   const handles = runtimeHandles.get(agent)
-  if (handles) {
-    handles.abortController.abort()
-    handles.stopHeartbeat()
-    await handles.stopRedisDelivery()
-  }
-  try {
-    await agent.shutdown()
-  } finally {
+  runtimeHandles.delete(agent)
+  handles?.abortController.abort()
+  handles?.stopHeartbeat()
+
+  // Stop inbound traffic before closing the clients its handlers use. Every step
+  // runs even if an earlier one fails, so resources and telemetry are still released.
+  const steps = [
+    () => handles?.closeWebSocketClients(),
+    () => agent.shutdown(),
+    () => handles?.stopRedisDelivery(),
+    () => handles?.stopQueue(),
+    () => handles?.stopCache(),
+  ]
+  const errors: unknown[] = []
+  for (const step of steps) {
     try {
-      await handles?.stopQueue()
-    } finally {
-      await handles?.stopCache()
-      runtimeHandles.delete(agent)
+      await step()
+    } catch (error) {
+      errors.push(error)
     }
   }
+  if (errors.length === 0) return
+  for (const error of errors.slice(1)) agent.config.logger.error('Additional mediator shutdown failure', { error })
+  throw errors[0]
 }
 
 export type MediatorAgent = Agent<Awaited<ReturnType<typeof createModules>>>

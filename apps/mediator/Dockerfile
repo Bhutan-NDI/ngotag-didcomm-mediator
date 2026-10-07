@@ -29,4 +29,4 @@ RUN addgroup --system --gid 1001 agent && \
 
 USER agent
 
-ENTRYPOINT [ "pnpm", "--filter", "didcomm-mediator-service", "start" ]
+ENTRYPOINT [ "node", "--import", "./apps/mediator/build/telemetry/register.js", "--import", "./apps/mediator/build/telemetry/sdk.js", "apps/mediator/build/index.js" ]

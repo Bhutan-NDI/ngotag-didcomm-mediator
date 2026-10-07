@@ -100,10 +100,7 @@ export class InstrumentedQueueTransportRepository implements ExtendedQueueTransp
             queueMessageAge.record(Math.max(0, now - message.receivedAt.getTime()) / 1000, { backend: this.backend })
           }
         }
-        rememberQueuedTelemetry(
-          options.connectionId,
-          messages.map((message) => (message as QueuedDidCommMessage & { telemetry?: TelemetryCarrier }).telemetry)
-        )
+        rememberQueuedTelemetry(messages as Array<QueuedDidCommMessage & { telemetry?: TelemetryCarrier }>)
         return messages
       },
       { 'messaging.batch.message_count': options.limit }

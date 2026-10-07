@@ -87,7 +87,7 @@ export async function loadRedisMessageDelivery({
   // if a server crashes we lose the active socket connections.
   const streamPublishing = new RedisStreamMessagePublishing(agent, client, randomUUID())
 
-  agent.events.on<DidcommMessageQueuedEvent>(MediatorEventTypes.DidCommMessageQueued, async (event) => {
+  const handleMessageQueued = async (event: DidcommMessageQueuedEvent) => {
     const connectionId = event.payload.connectionId
 
     agent.config.logger.debug(
@@ -169,7 +169,19 @@ export async function loadRedisMessageDelivery({
     }
 
     await sendNotification(agent.context, connectionId)
-  })
+  }
+
+  // Credo's event emitter does not handle listener rejections, which would otherwise
+  // be unhandled (e.g. Redis closed while a queued event is still being handled).
+  const onMessageQueued = (event: DidcommMessageQueuedEvent) => {
+    handleMessageQueued(event).catch((error) => {
+      agent.config.logger.error('Error handling queued message for multi-instance delivery', {
+        connectionId: event.payload.connectionId,
+        error,
+      })
+    })
+  }
+  agent.events.on<DidcommMessageQueuedEvent>(MediatorEventTypes.DidCommMessageQueued, onMessageQueued)
 
   // We want to send a push notification for all messages that were emitted on the stream but not handled
   // it probably means the socket was closed and thus not correctly handled.
@@ -237,6 +249,7 @@ export async function loadRedisMessageDelivery({
   )
 
   return async () => {
+    agent.events.off<DidcommMessageQueuedEvent>(MediatorEventTypes.DidCommMessageQueued, onMessageQueued)
     shutdownController.abort()
     await Promise.allSettled([claimPendingMessagesTask, listenForMessagesTask])
     if (ownsClient) await client.quit()
