@@ -35,17 +35,48 @@ describe('QueuedMessageDeliveryCoordinator', () => {
       return await firstRun.promise
     })
     deliver.mockResolvedValueOnce(false)
-    const fallback = vi.fn().mockResolvedValue(undefined)
+    const fallbackResult = deferred<void>()
+    const fallback = vi.fn().mockImplementation(() => fallbackResult.promise)
     const coordinator = new QueuedMessageDeliveryCoordinator(deliver, fallback, 60_000)
 
     const first = coordinator.schedule('connection-1')
     await firstRunStarted.promise
     const followUp = coordinator.schedule('connection-1')
     firstRun.resolve(false)
+    await new Promise((resolve) => setTimeout(resolve, 0))
 
-    await Promise.all([first, followUp])
     expect(deliver).toHaveBeenCalledTimes(2)
+    fallbackResult.resolve()
+    await Promise.all([first, followUp])
     expect(fallback).toHaveBeenCalledOnce()
+  })
+
+  test('falls back again for later triggers while a drain stays hung', async () => {
+    vi.useFakeTimers()
+    const deliver = vi.fn().mockImplementation(() => new Promise<boolean>(() => {}))
+    const fallback = vi.fn().mockResolvedValue(undefined)
+    const coordinator = new QueuedMessageDeliveryCoordinator(deliver, fallback, 45_000, 55_000)
+
+    const first = coordinator.schedule('connection-1')
+    await vi.advanceTimersByTimeAsync(45_000)
+    await first
+    expect(fallback).toHaveBeenCalledTimes(1)
+
+    // The follow-up run cannot start behind the hung drain. Its owner must still
+    // route for its own message rather than reuse the first, settled fallback.
+    const second = coordinator.schedule('connection-1')
+    await vi.advanceTimersByTimeAsync(45_000)
+    await second
+    expect(fallback).toHaveBeenCalledTimes(2)
+
+    // Later triggers join that same unstarted run after its owner settled. They
+    // elect a new owner, and a burst of them still shares one fallback.
+    const burst = [coordinator.schedule('connection-1'), coordinator.schedule('connection-1')]
+    await vi.advanceTimersByTimeAsync(45_000)
+    await Promise.all(burst)
+    expect(fallback).toHaveBeenCalledTimes(3)
+    expect(fallback).toHaveBeenLastCalledWith('connection-1', { status: 'timed-out' })
+    expect(deliver).toHaveBeenCalledOnce()
   })
 
   test('bounds a follow-up queued behind a hung delivery without duplicating fallback', async () => {
