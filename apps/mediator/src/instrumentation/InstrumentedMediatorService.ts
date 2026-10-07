@@ -8,7 +8,7 @@ import {
   DidCommMediatorService,
 } from '@credo-ts/didcomm'
 
-import { config } from '../config.js'
+import { effectiveCredoMessageForwardingStrategy } from '../config.js'
 import {
   durationMs,
   emitStructured,
@@ -74,7 +74,7 @@ export class InstrumentedMediatorService extends DidCommMediatorService {
       span_id: spanId,
       jwe_fp: jweFp,
       recipient_key_short: recipientKeyShort,
-      decision: config.messagePickup.forwardingStrategy,
+      decision: effectiveCredoMessageForwardingStrategy,
     })
 
     try {
