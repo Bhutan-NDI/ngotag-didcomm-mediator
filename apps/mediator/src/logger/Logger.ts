@@ -1,4 +1,5 @@
 import { BaseLogger, LogLevel } from '@credo-ts/core'
+import { isSpanContextValid, trace } from '@opentelemetry/api'
 import { ILogObj, Logger as TSLogger } from 'tslog'
 
 import { createSafeJsonReplacer } from './replaceError.js'
@@ -32,8 +33,22 @@ export class Logger extends BaseLogger {
 
     if (this.logLevel === LogLevel.off) return
 
-    if (data) {
-      this.logger[tsLogLevel](message, JSON.parse(JSON.stringify(data, createSafeJsonReplacer(), 2)))
+    const spanContext = trace.getActiveSpan()?.spanContext()
+    const traceContext =
+      spanContext && isSpanContextValid(spanContext)
+        ? {
+            trace_id: spanContext.traceId,
+            span_id: spanContext.spanId,
+            trace_flags: spanContext.traceFlags,
+          }
+        : undefined
+    const safeData = data
+      ? (JSON.parse(JSON.stringify(data, createSafeJsonReplacer(), 2)) as Record<string, unknown>)
+      : undefined
+    const logData = safeData || traceContext ? { ...safeData, ...traceContext } : undefined
+
+    if (logData) {
+      this.logger[tsLogLevel](message, logData)
     } else {
       this.logger[tsLogLevel](message)
     }

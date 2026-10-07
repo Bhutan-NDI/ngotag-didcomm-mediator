@@ -80,6 +80,27 @@ suite('dynamodb client', () => {
     expect(message.recipientDids).toEqual(recipientDids)
   })
 
+  test('round-trips W3C trace context in the queue sidecar', async () => {
+    const telemetryConnectionId = 'telemetry-connection-id'
+    const telemetry = {
+      traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+      tracestate: 'vendor=value',
+    }
+    const id = await client.addMessage({
+      connectionId: telemetryConnectionId,
+      encryptedMessage,
+      recipientDids,
+      telemetry,
+    })
+
+    try {
+      const [message] = await client.getMessages({ connectionId: telemetryConnectionId, limit: 1 })
+      expect(message.telemetry).toEqual(telemetry)
+    } finally {
+      await client.removeMessages({ connectionId: telemetryConnectionId, messageIds: [id] })
+    }
+  })
+
   test('get message and remove a message', async () => {
     const count = await client.getMessageCount(connectionId)
 

@@ -5,9 +5,11 @@ import {
 } from '@credo-ts/didcomm'
 import Redis from 'ioredis'
 import type { MediatorAgent } from '../../agent.js'
+import { injectTelemetryContext, type TelemetryCarrier } from '../../telemetry/api.js'
 
 export interface StreamMessagePayload {
   connectionId: string
+  telemetry?: TelemetryCarrier
 }
 
 export interface StreamMessage {
@@ -85,7 +87,7 @@ export class RedisStreamMessagePublishing {
    */
   public async sendMessageToServer(targetServerId: string, data: StreamMessagePayload): Promise<void> {
     const streamKey = this.getStreamKey(targetServerId)
-    await this.client.xadd(streamKey, '*', 'message', JSON.stringify(data))
+    await this.client.xadd(streamKey, '*', 'message', JSON.stringify({ ...data, telemetry: injectTelemetryContext() }))
   }
 
   /**

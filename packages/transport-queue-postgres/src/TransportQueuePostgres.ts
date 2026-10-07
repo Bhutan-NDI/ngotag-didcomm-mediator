@@ -55,6 +55,15 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
     )
   }
 
+  public getPoolStats(): { total: number; idle: number; waiting: number } | null {
+    if (!this.messagesCollection) return null
+    return {
+      total: this.messagesCollection.totalCount,
+      idle: this.messagesCollection.idleCount,
+      waiting: this.messagesCollection.waitingCount,
+    }
+  }
+
   /**
    * Initializes the service by setting up the database, message listeners, and the agent.
    * This method also configures the Pub/Sub system and registers event handlers.
@@ -148,7 +157,7 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
       // If deleteMessages is true, just fetch messages without updating their state
       if (deleteMessages) {
         const query = `
-        SELECT id, encrypted_message, state, created_at 
+        SELECT id, encrypted_message, state, created_at, telemetry
         FROM queued_message 
         WHERE (connection_id = $1 OR $2 = ANY (recipient_dids)) AND state = 'pending' 
         ORDER BY created_at 
@@ -167,6 +176,7 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
           encryptedMessage: message.encrypted_message,
           receivedAt: new Date(message.created_at),
           state: message.state,
+          telemetry: message.telemetry ?? undefined,
         }))
       }
 
@@ -182,7 +192,7 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
         ORDER BY created_at 
         LIMIT $3
       )
-      RETURNING id, encrypted_message, state, created_at;
+      RETURNING id, encrypted_message, state, created_at, telemetry;
     `
       const params = [connectionId, recipientDid, limit ?? 0]
       const result = await this.messagesCollection?.query(query, params)
@@ -200,6 +210,7 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
         encryptedMessage: message.encrypted_message,
         receivedAt: new Date(message.created_at),
         state: 'sending',
+        telemetry: message.telemetry ?? undefined,
       }))
     } catch (error) {
       agentContext.config.logger.error(`[takeFromQueue] Error: ${error}`)
@@ -260,7 +271,9 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
    * @throws {Error} Throws an error if the agent is not defined or if an error occurs during message insertion or processing.
    */
   public async addMessage(agentContext: AgentContext, options: AddMessageOptions): Promise<string> {
-    const { connectionId, recipientDids, payload } = options
+    const { connectionId, recipientDids, payload, telemetry } = options as AddMessageOptions & {
+      telemetry?: Record<string, string>
+    }
     agentContext.config.logger.debug(`[addMessage] Initializing new message for connectionId: ${connectionId}`)
     const receivedAt = new Date()
 
@@ -274,8 +287,8 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
 
       // Insert message into database
       const query = `
-        INSERT INTO queued_message(connection_id, recipient_dids, encrypted_message, state, created_at) 
-        VALUES($1, $2, $3, $4, $5) 
+        INSERT INTO queued_message(connection_id, recipient_dids, encrypted_message, state, created_at, telemetry)
+        VALUES($1, $2, $3, $4, $5, $6)
         RETURNING id
       `
 
@@ -287,6 +300,7 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
         payload,
         state,
         receivedAt,
+        telemetry,
       ])
 
       const messageRecord = result?.rows[0]
@@ -306,6 +320,7 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
           encryptedMessage: payload,
           receivedAt,
           state,
+          telemetry,
         },
         session: localLiveSession || liveSessionInPostgres || undefined,
       })
@@ -377,7 +392,7 @@ export class DidCommTransportQueuePostgres implements DidCommQueueTransportRepos
 
   public async shutdown(agentContext: AgentContext) {
     agentContext.config.logger.info('[shutdown] Close connection to postgres')
-    await this.messagesCollection?.end()
+    await Promise.all([this.messagesCollection?.end(), this.pubSubInstance.close()])
   }
 
   /**

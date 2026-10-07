@@ -15,4 +15,6 @@ if (sample) {
   })
 }
 
+await import('./src/telemetry/register.js')
+await import('./src/telemetry/sdk.js')
 await import('./src/index.js')

@@ -29,4 +29,4 @@ RUN addgroup --system --gid 1001 agent && \
 
 USER agent
 
-ENTRYPOINT [ "node", "apps/mediator/build/index.js" ]
+ENTRYPOINT [ "node", "--import", "./apps/mediator/build/telemetry/register.js", "--import", "./apps/mediator/build/telemetry/sdk.js", "apps/mediator/build/index.js" ]

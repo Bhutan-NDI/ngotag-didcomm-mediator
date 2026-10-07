@@ -6,6 +6,41 @@ import { config } from '../config.js'
 import { DidcommMessageQueuedEvent, MediatorEventTypes } from '../events.js'
 import { RedisStreamMessagePublishing } from '../multi-instance/redis-stream-message-publishing/redisStreamMessagePublishing.js'
 import { sendNotification } from '../push-notifications/sendNotification.js'
+import {
+  deliveryCounter,
+  deliveryDuration,
+  hashIdentifier,
+  instrumentOperation,
+  SpanKind,
+  withExtractedTelemetryContext,
+} from '../telemetry/api.js'
+
+async function consumeRedisDelivery<T>(
+  connectionId: string,
+  telemetry: Record<string, string> | undefined,
+  callback: () => Promise<T>
+): Promise<T> {
+  return withExtractedTelemetryContext(telemetry, () =>
+    instrumentOperation('didcomm.delivery.redis.consume', {
+      span: {
+        kind: SpanKind.CONSUMER,
+        attributes: {
+          'messaging.system': 'redis',
+          'messaging.destination.name': 'didcomm.delivery',
+          'messaging.operation.name': 'process',
+          'messaging.operation.type': 'process',
+          'didcomm.connection.id_hash': hashIdentifier(connectionId),
+        },
+      },
+      callback: async () => callback(),
+      record: (outcome, elapsed) => {
+        const attributes = { transport: 'redis', outcome }
+        deliveryCounter.add(1, attributes)
+        deliveryDuration.record(elapsed, attributes)
+      },
+    })
+  )
+}
 
 /**
  * Initialize redis message publishing for queued mediator messages. This message publishing implementation is not
@@ -34,18 +69,25 @@ export async function loadRedisMessageDelivery({
   abortSignal?: AbortSignal
   agent: MediatorAgent
   redisClient?: Redis.default
-}) {
-  if (config.cache.type !== 'redis' || config.messagePickup.multiInstanceDelivery.type !== 'redis') return
+}): Promise<() => Promise<void>> {
+  if (config.cache.type !== 'redis' || config.messagePickup.multiInstanceDelivery.type !== 'redis') {
+    return async () => {}
+  }
 
   agent.config.logger.info('Loading redis multi instance message delivery')
 
+  const ownsClient = redisClient === undefined
   const client = redisClient ?? new Redis.default(config.cache.redisUrl)
+  const shutdownController = new AbortController()
+  const deliverySignal = abortSignal
+    ? AbortSignal.any([abortSignal, shutdownController.signal])
+    : shutdownController.signal
 
   // We generate a random server instance, it does not really matter as long as it's unique between active servers
   // if a server crashes we lose the active socket connections.
   const streamPublishing = new RedisStreamMessagePublishing(agent, client, randomUUID())
 
-  agent.events.on<DidcommMessageQueuedEvent>(MediatorEventTypes.DidCommMessageQueued, async (event) => {
+  const handleMessageQueued = async (event: DidcommMessageQueuedEvent) => {
     const connectionId = event.payload.connectionId
 
     agent.config.logger.debug(
@@ -127,66 +169,89 @@ export async function loadRedisMessageDelivery({
     }
 
     await sendNotification(agent.context, connectionId)
-  })
+  }
+
+  // Credo's event emitter does not handle listener rejections, which would otherwise
+  // be unhandled (e.g. Redis closed while a queued event is still being handled).
+  const onMessageQueued = (event: DidcommMessageQueuedEvent) => {
+    handleMessageQueued(event).catch((error) => {
+      agent.config.logger.error('Error handling queued message for multi-instance delivery', {
+        connectionId: event.payload.connectionId,
+        error,
+      })
+    })
+  }
+  agent.events.on<DidcommMessageQueuedEvent>(MediatorEventTypes.DidCommMessageQueued, onMessageQueued)
 
   // We want to send a push notification for all messages that were emitted on the stream but not handled
   // it probably means the socket was closed and thus not correctly handled.
-  void streamPublishing.claimPendingMessages(
+  const claimPendingMessagesTask = streamPublishing.claimPendingMessages(
     async (serverId, message) => {
-      agent.config.logger.debug(
-        `Server '${streamPublishing.serverId}' claimed pending message ${message.id} from server ${serverId}. Trying to send push notification.`
-      )
+      await consumeRedisDelivery(message.payload.connectionId, message.payload.telemetry, async () => {
+        agent.config.logger.debug(
+          `Server '${streamPublishing.serverId}' claimed pending message ${message.id} from server ${serverId}. Trying to send push notification.`
+        )
 
-      await sendNotification(agent.context, message.payload.connectionId)
+        await sendNotification(agent.context, message.payload.connectionId)
+      })
     },
-    { signal: abortSignal }
+    { signal: deliverySignal }
   )
 
   // First we want to try to send the message to an open socket connection. If that's not possible, we will emit a push notification.
-  void streamPublishing.listenForMessages(
+  const listenForMessagesTask = streamPublishing.listenForMessages(
     async (message) => {
-      agent.config.logger.debug(
-        `Server '${streamPublishing.serverId}' received message ${message.id} for connection '${message.payload.connectionId}'. Attempting to deliver to local session.`
-      )
+      await consumeRedisDelivery(message.payload.connectionId, message.payload.telemetry, async () => {
+        agent.config.logger.debug(
+          `Server '${streamPublishing.serverId}' received message ${message.id} for connection '${message.payload.connectionId}'. Attempting to deliver to local session.`
+        )
 
-      const pickupSession = await agent.didcomm.messagePickup.getLiveModeSession({
-        connectionId: message.payload.connectionId,
-        role: DidCommMessagePickupSessionRole.MessageHolder,
-      })
+        const pickupSession = await agent.didcomm.messagePickup.getLiveModeSession({
+          connectionId: message.payload.connectionId,
+          role: DidCommMessagePickupSessionRole.MessageHolder,
+        })
 
-      if (pickupSession) {
-        try {
+        if (pickupSession) {
+          try {
+            agent.config.logger.debug(
+              `Found local session for connection '${message.payload.connectionId}'. Delivering messages from queue.`
+            )
+
+            await agent.didcomm.messagePickup.deliverMessagesFromQueue({
+              pickupSessionId: pickupSession.id,
+            })
+
+            agent.config.logger.debug(
+              `Successfully delivered messages to local session for connection '${message.payload.connectionId}' for message ${message.id}`
+            )
+
+            // We delivered the messages, we don't have to send a push notification
+            // Improvement: If we haven't received an ack in X seconds, we should still
+            // send the push notification
+            return
+          } catch (error) {
+            // In case an error occurred with the delivery of the message, we will send a push notification
+            agent.config.logger.debug(
+              `Error delivering message ${message.id} to local session for connection '${message.payload.connectionId}'. Falling back to push notification.`,
+              { error }
+            )
+          }
+        } else {
           agent.config.logger.debug(
-            `Found local session for connection '${message.payload.connectionId}'. Delivering messages from queue.`
-          )
-
-          await agent.didcomm.messagePickup.deliverMessagesFromQueue({
-            pickupSessionId: pickupSession.id,
-          })
-
-          agent.config.logger.debug(
-            `Successfully delivered messages to local session for connection '${message.payload.connectionId}' for message ${message.id}`
-          )
-
-          // We delivered the messages, we don't have to send a push notification
-          // Improvement: If we haven't received an ack in X seconds, we should still
-          // send the push notification
-          return
-        } catch (error) {
-          // In case an error occurred with the delivery of the message, we will send a push notification
-          agent.config.logger.debug(
-            `Error delivering message ${message.id} to local session for connection '${message.payload.connectionId}'. Falling back to push notification.`,
-            { error }
+            `No local session found for connection '${message.payload.connectionId}'. Falling back to push notification.`
           )
         }
-      } else {
-        agent.config.logger.debug(
-          `No local session found for connection '${message.payload.connectionId}'. Falling back to push notification.`
-        )
-      }
 
-      await sendNotification(agent.context, message.payload.connectionId)
+        await sendNotification(agent.context, message.payload.connectionId)
+      })
     },
-    { signal: abortSignal }
+    { signal: deliverySignal }
   )
+
+  return async () => {
+    agent.events.off<DidcommMessageQueuedEvent>(MediatorEventTypes.DidCommMessageQueued, onMessageQueued)
+    shutdownController.abort()
+    await Promise.allSettled([claimPendingMessagesTask, listenForMessagesTask])
+    if (ownsClient) await client.quit()
+  }
 }
