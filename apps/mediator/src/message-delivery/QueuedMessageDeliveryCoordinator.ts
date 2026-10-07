@@ -15,6 +15,7 @@ export class QueuedMessageDeliveryCoordinator<Key> {
   private readonly delivery: KeyedSingleFlight<Key, boolean>
   private readonly fallbackByFlight = new WeakMap<object, FallbackState>()
   private readonly fallbackInProgressByKey = new Map<Key, FallbackState>()
+  private readonly outcomeByRun = new WeakMap<Promise<boolean>, Promise<void>>()
 
   public constructor(
     deliver: (key: Key) => Promise<boolean>,
@@ -29,16 +30,23 @@ export class QueuedMessageDeliveryCoordinator<Key> {
    * Schedule one serialized delivery run for a key. Local delivery is bounded
    * from this call, including time queued behind a predecessor, and fallback is
    * bounded by the overall completion deadline. Non-owners share the owner's
-   * delivery and fallback side effects.
+   * delivery, fallback and outcome, so a stream entry coalesced onto a run is
+   * not acknowledged when that run's fallback fails.
    *
    * Stream callers schedule as soon as an entry is read: Redis measures pending
    * idle time from delivery to the consumer, so that is the clock the 60-second
    * claim races against, not the entry's creation time.
    */
-  public async schedule(key: Key): Promise<void> {
+  public schedule(key: Key): Promise<void> {
     const delivery = this.delivery.schedule(key)
-    if (!delivery.isOwner) return
+    if (!delivery.isOwner) return this.outcomeByRun.get(delivery.result) ?? Promise.resolve()
 
+    const outcome = this.runAsOwner(delivery, key)
+    this.outcomeByRun.set(delivery.result, outcome)
+    return outcome
+  }
+
+  private async runAsOwner(delivery: ScheduledFlight<boolean>, key: Key): Promise<void> {
     const startedAt = Date.now()
     const deliveryDeadline = startedAt + this.deliveryTimeoutMs
     const completionDeadline = startedAt + this.completionTimeoutMs

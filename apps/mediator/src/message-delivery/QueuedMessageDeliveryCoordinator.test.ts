@@ -114,6 +114,19 @@ describe('QueuedMessageDeliveryCoordinator', () => {
     expect(fallback).toHaveBeenCalledOnce()
   })
 
+  test('shares a failed fallback outcome with coalesced callers', async () => {
+    const error = new Error('push failed')
+    const fallback = vi.fn().mockRejectedValue(error)
+    const coordinator = new QueuedMessageDeliveryCoordinator(() => Promise.resolve(false), fallback, 60_000)
+
+    const owner = coordinator.schedule('connection-1')
+    const follower = coordinator.schedule('connection-1')
+
+    await expect(owner).rejects.toThrow(error)
+    await expect(follower).rejects.toThrow(error)
+    expect(fallback).toHaveBeenCalledOnce()
+  })
+
   test('turns a delivery rejection into one fallback outcome', async () => {
     const error = new Error('delivery failed')
     const fallback = vi.fn().mockResolvedValue(undefined)

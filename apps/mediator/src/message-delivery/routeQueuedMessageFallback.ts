@@ -39,6 +39,8 @@ export async function routeQueuedMessageFallback({
     // A timed-out drain may still be running against an open socket, so the
     // registration is not known to be stale. Keep it so other servers can still
     // forward here; LiveSessionRemoved clears it if the session has gone.
+    // Trade-off: a half-open socket keeps receiving routed messages that time
+    // out and fall back to push until LiveSessionRemoved or the 1 h key TTL.
     if (reason?.status === 'timed-out') {
       logger.debug(
         `Found own server '${serverId}' in redis for connection '${connectionId}'. Keeping the registration while local delivery may still be running, and sending a push notification.`
