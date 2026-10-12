@@ -44,11 +44,19 @@ export type DynamoDbClientRepositoryOptions = DynamoDBClientConfigType & {
   tableName?: string
   /** @default <tableName>_recipient_index */
   recipientIndexTableName?: string
+  /**
+   * How long a message taken by a pickup v2 delivery stays claimed before it becomes available again, if the
+   * holder never acknowledges it with messages-received.
+   * @default 30000
+   */
+  claimTtlMs?: number
   logger: Logger
 }
 
 type RecipientIndexMetadata = { cutoverMessageId: number }
 type RecipientIndexEntry = { messageId: string }
+
+export const DEFAULT_MESSAGE_CLAIM_TTL_MS = 30_000
 
 const RECIPIENT_INDEX_METADATA_KEY = '__recipient_index_metadata__'
 const RECIPIENT_INDEX_PREFIX = 'r#'
@@ -70,12 +78,18 @@ export class DynamoDbClientRepository {
   private dynamodbClient: DynamoDBClient
   private tableName: string
   private recipientIndexTableName: string
+  private claimTtlMs: number
   private logger: Logger
 
   private constructor(options: DynamoDbClientRepositoryOptions) {
-    this.dynamodbClient = new DynamoDBClient(options)
+    const { claimTtlMs = DEFAULT_MESSAGE_CLAIM_TTL_MS, ...clientOptions } = options
+    if (!Number.isInteger(claimTtlMs) || claimTtlMs < 1) {
+      throw new Error('claimTtlMs must be a positive integer number of milliseconds')
+    }
+    this.dynamodbClient = new DynamoDBClient(clientOptions)
     this.tableName = options.tableName ?? 'queued_messages'
     this.recipientIndexTableName = options.recipientIndexTableName ?? `${this.tableName}_recipient_index`
+    this.claimTtlMs = claimTtlMs
     this.logger = options.logger
   }
 
@@ -381,12 +395,11 @@ export class DynamoDbClientRepository {
     recipientDid?: string
     deleteMessages?: boolean
   }) {
-    const messages =
-      options.recipientDid === undefined
-        ? await this.getMessagesByConnection(options.connectionId, options.limit)
-        : await this.getRecipientMessages(options.connectionId, options.recipientDid, options.limit)
+    if (!options.deleteMessages) return await this.claimMessages(options)
 
-    if (options.deleteMessages && messages.length > 0) {
+    const messages = await this.findMessages(options.connectionId, options.recipientDid, options.limit)
+
+    if (messages.length > 0) {
       try {
         await this.removeMessages({
           connectionId: options.connectionId,
@@ -406,6 +419,80 @@ export class DynamoDbClientRepository {
       }
     }
     return messages
+  }
+
+  /**
+   * Pickup v2 path: messages stay queued until the holder's messages-received, so each returned message is first
+   * claimed with a conditional write. Without the claim, two delivery-requests (or a delivery-request and a live
+   * mode drain) arriving before the acknowledgement would return the same messages. The condition is evaluated by
+   * DynamoDB, so this holds across mediator instances. A claim that is never acknowledged lapses after claimTtlMs
+   * and the message is delivered again rather than lost.
+   */
+  private async claimMessages(options: {
+    connectionId: string
+    limit?: number
+    recipientDid?: string
+  }): Promise<QueuedMessage[]> {
+    const { connectionId, recipientDid, limit } = options
+    const claimed: QueuedMessage[] = []
+    // Ids this call already attempted, whether it won or lost the claim, so a stale read cannot retry them.
+    const attempted = new Set<string>()
+    // Claimed messages still occupy the front of the queue, so when every candidate in the window is taken the
+    // window grows until it reaches unclaimed messages or the end of the queue.
+    let window = limit
+
+    while (limit === undefined || claimed.length < limit) {
+      const now = Date.now()
+      const candidates = await this.findMessages(connectionId, recipientDid, window)
+      const available = candidates.filter((message) => !attempted.has(message.id) && !this.isClaimed(message, now))
+      const toClaim = limit === undefined ? available : available.slice(0, limit - claimed.length)
+
+      if (toClaim.length === 0) {
+        if (window === undefined || candidates.length < window) break
+        window *= 2
+        continue
+      }
+
+      for (const message of toClaim) attempted.add(message.id)
+      const results = await Promise.all(toClaim.map((message) => this.claimMessage(connectionId, message.id, now)))
+      claimed.push(...toClaim.filter((_, index) => results[index]))
+
+      // Without a limit the whole queue was read, so there is nothing further to look at.
+      if (window === undefined) break
+    }
+
+    return claimed.map(({ claimedUntil: _claimedUntil, ...message }) => message)
+  }
+
+  private isClaimed(message: QueuedMessage, now: number): boolean {
+    return message.claimedUntil !== undefined && message.claimedUntil > now
+  }
+
+  /** Returns false when another delivery already holds an unexpired claim, or the message was removed meanwhile. */
+  private async claimMessage(connectionId: string, messageId: string, now: number): Promise<boolean> {
+    try {
+      await this.dynamodbClient.send(
+        new UpdateItemCommand({
+          TableName: this.tableName,
+          Key: marshall({ connectionId, messageId: Number(messageId) }),
+          UpdateExpression: 'SET claimedUntil = :claimedUntil',
+          // attribute_exists stops the update from recreating a message acknowledged since it was read.
+          ConditionExpression:
+            'attribute_exists(messageId) AND (attribute_not_exists(claimedUntil) OR claimedUntil <= :now)',
+          ExpressionAttributeValues: marshall({ ':claimedUntil': now + this.claimTtlMs, ':now': now }),
+        })
+      )
+      return true
+    } catch (error) {
+      if (error instanceof Error && error.name === 'ConditionalCheckFailedException') return false
+      throw error
+    }
+  }
+
+  private async findMessages(connectionId: string, recipientDid?: string, limit?: number): Promise<QueuedMessage[]> {
+    return recipientDid === undefined
+      ? await this.getMessagesByConnection(connectionId, limit)
+      : await this.getRecipientMessages(connectionId, recipientDid, limit)
   }
 
   private async getMessagesByConnection(connectionId: string, limit?: number): Promise<QueuedMessage[]> {

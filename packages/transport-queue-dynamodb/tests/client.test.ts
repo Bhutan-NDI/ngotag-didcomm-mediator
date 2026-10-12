@@ -12,6 +12,8 @@ const encryptedMessage: DidCommEncryptedMessage = {
   tag: 'tag',
 }
 
+const CLAIM_TTL_MS = 100
+
 suite('dynamodb client', () => {
   let client: DynamoDbClientRepository
 
@@ -23,6 +25,8 @@ suite('dynamodb client', () => {
         accessKeyId: 'local',
         secretAccessKey: 'local',
       },
+      // Short enough that a message taken without deleteMessages becomes available again within one test.
+      claimTtlMs: CLAIM_TTL_MS,
     })
   })
 
@@ -64,6 +68,11 @@ suite('dynamodb client', () => {
   })
 
   test('get a message and filter on recipient did', async () => {
+    // The previous test claimed the only message without acknowledging it. Until the claim lapses it is not
+    // delivered again.
+    expect(await client.getMessages({ connectionId, limit: 1, recipientDid: recipientDids[0] })).toEqual([])
+    await new Promise((resolve) => setTimeout(resolve, CLAIM_TTL_MS + 50))
+
     const messages = await client.getMessages({
       connectionId: connectionId,
       limit: 1,

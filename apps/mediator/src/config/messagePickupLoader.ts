@@ -10,7 +10,7 @@ export interface ExtendedQueueTransportRepository extends DidCommQueueTransportR
 }
 
 export async function loadMessagePickupStorage(): Promise<ExtendedQueueTransportRepository> {
-  const { storage } = config.messagePickup
+  const { storage, claimTtlMs } = config.messagePickup
 
   if (storage.type === 'dynamodb') {
     logger.info('Using dynamodb message pickup storage')
@@ -20,6 +20,7 @@ export async function loadMessagePickupStorage(): Promise<ExtendedQueueTransport
       logger,
       region: storage.region,
       tableName: storage.tableName,
+      claimTtlMs,
       recipientIndexTableName: storage.recipientIndexTableName,
       credentials: {
         accessKeyId: storage.accessKeyId,
@@ -40,5 +41,5 @@ export async function loadMessagePickupStorage(): Promise<ExtendedQueueTransport
   }
 
   logger.info('Using credo message pickup storage')
-  return new StorageServiceMessageQueue()
+  return new StorageServiceMessageQueue({ claimTtlMs })
 }

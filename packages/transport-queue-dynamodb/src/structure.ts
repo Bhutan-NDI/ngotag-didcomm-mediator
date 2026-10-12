@@ -5,6 +5,8 @@ import { QueuedDidCommMessage as CredoQueuedMessage } from '@credo-ts/didcomm'
 export type QueuedMessage = Required<CredoQueuedMessage> & {
   connectionId: string
   recipientDids: Array<string>
+  /** Epoch milliseconds until which a pickup v2 delivery holds this message, see DynamoDbClientRepository. */
+  claimedUntil?: number
 }
 
 export const attributeDefinitions: Array<AttributeDefinition> = [

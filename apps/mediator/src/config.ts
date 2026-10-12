@@ -232,6 +232,22 @@ const zConfig = z
           .default({
             type: 'credo',
           }),
+        // How long a message taken by a pickup v2 delivery stays claimed before it is delivered again, if the holder
+        // never acknowledges it with messages-received. Applies to the 'credo' and 'dynamodb' storage types.
+        claimTtlMs: z.coerce
+          .number({
+            error:
+              "Message pickup claim TTL must be a positive integer number of milliseconds. Defaults to 30000. Can also be set using 'MESSAGE_PICKUP__CLAIM_TTL_MS' environment variable",
+          })
+          .int({
+            error:
+              "Message pickup claim TTL must be a positive integer number of milliseconds. Defaults to 30000. Can also be set using 'MESSAGE_PICKUP__CLAIM_TTL_MS' environment variable",
+          })
+          .positive({
+            error:
+              "Message pickup claim TTL must be a positive integer number of milliseconds. Defaults to 30000. Can also be set using 'MESSAGE_PICKUP__CLAIM_TTL_MS' environment variable",
+          })
+          .default(30_000),
         multiInstanceDelivery: z
           .discriminatedUnion(
             'type',
@@ -257,6 +273,7 @@ const zConfig = z
         storage: {
           type: 'credo',
         },
+        claimTtlMs: 30_000,
         multiInstanceDelivery: {
           type: 'none',
         },
