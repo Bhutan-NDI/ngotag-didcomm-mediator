@@ -17,6 +17,13 @@ export class MessageRecord extends BaseRecord<DefaultMessageRecordTags> implemen
   public connectionId!: string
   public message!: DidCommEncryptedMessage
 
+  /**
+   * Epoch milliseconds until which this message is claimed by an in-flight delivery. While claimed it is not
+   * returned by `takeFromQueue`; if the delivery is never acknowledged the claim lapses and the message becomes
+   * available again.
+   */
+  public claimedUntil?: number
+
   public static override readonly type = 'MessageRecord'
   public override readonly type = MessageRecord.type
 
@@ -29,6 +36,10 @@ export class MessageRecord extends BaseRecord<DefaultMessageRecordTags> implemen
       this.connectionId = props.connectionId
       this.message = props.message
     }
+  }
+
+  public isClaimed(now: number = Date.now()) {
+    return this.claimedUntil !== undefined && this.claimedUntil > now
   }
 
   public getTags() {
