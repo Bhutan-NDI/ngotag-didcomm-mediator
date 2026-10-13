@@ -433,6 +433,44 @@ suite('dynamodb recipient index', () => {
     }
   })
 
+  test('persists W3C trace context alongside the encrypted message', async () => {
+    const traceparent = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof GetItemCommand) {
+        return {
+          Item: {
+            connectionId: { S: connectionId },
+            recipientMessageId: { S: '__recipient_index_metadata__' },
+            cutoverMessageId: { N: '0' },
+          },
+        } as never
+      }
+      return {} as never
+    })
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      await client.addMessage({
+        connectionId,
+        recipientDids: [recipientDid],
+        encryptedMessage: { ciphertext: 'a', iv: 'b', protected: 'c', tag: 'd' },
+        receivedAt: new Date(1),
+        telemetry: { traceparent },
+      })
+
+      const transaction = send.mock.calls
+        .map(([command]) => command as unknown)
+        .find((command): command is TransactWriteItemsCommand => command instanceof TransactWriteItemsCommand)
+      const update = transaction?.input.TransactItems?.[0].Update
+      expect(update?.UpdateExpression).toContain('telemetry = :tc')
+      expect(update?.ExpressionAttributeValues?.[':tc']).toEqual({ M: { traceparent: { S: traceparent } } })
+    } finally {
+      send.mockRestore()
+    }
+  })
+
   test('retries a throttled atomic enqueue with a stable idempotency token', async () => {
     const transactionTokens: Array<string | undefined> = []
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {

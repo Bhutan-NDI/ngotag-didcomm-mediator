@@ -21,6 +21,7 @@ export interface PostgresMessageQueuedEvent extends BaseEvent {
       encryptedMessage: DidCommEncryptedMessage
       receivedAt: Date
       state: 'pending' | 'sending'
+      telemetry?: Record<string, string>
     }
     session?: DidCommMessagePickupSession
   }

@@ -5,6 +5,7 @@ import { QueuedDidCommMessage as CredoQueuedMessage } from '@credo-ts/didcomm'
 export type QueuedMessage = Required<CredoQueuedMessage> & {
   connectionId: string
   recipientDids: Array<string>
+  telemetry?: Record<string, string>
 }
 
 export const attributeDefinitions: Array<AttributeDefinition> = [

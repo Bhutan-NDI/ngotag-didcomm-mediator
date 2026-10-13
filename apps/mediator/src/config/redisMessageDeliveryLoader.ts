@@ -12,12 +12,47 @@ import {
 import { routeQueuedMessageFallback } from '../message-delivery/routeQueuedMessageFallback.js'
 import { RedisStreamMessagePublishing } from '../multi-instance/redis-stream-message-publishing/redisStreamMessagePublishing.js'
 import { sendNotification } from '../push-notifications/sendNotification.js'
+import {
+  deliveryCounter,
+  deliveryDuration,
+  hashIdentifier,
+  instrumentOperation,
+  SpanKind,
+  withExtractedTelemetryContext,
+} from '../telemetry/api.js'
 
 // Bound local work from event arrival and leave time for routing/notification
 // plus stream acknowledgement before another server may reclaim the entry.
 const LOCAL_DELIVERY_TIMEOUT_MS = 45_000
 const MESSAGE_HANDLING_TIMEOUT_MS = 55_000
 const PENDING_MESSAGE_FAILOVER_MS = 60_000
+
+async function consumeRedisDelivery<T>(
+  connectionId: string,
+  telemetry: Record<string, string> | undefined,
+  callback: () => Promise<T>
+): Promise<T> {
+  return withExtractedTelemetryContext(telemetry, () =>
+    instrumentOperation('didcomm.delivery.redis.consume', {
+      span: {
+        kind: SpanKind.CONSUMER,
+        attributes: {
+          'messaging.system': 'redis',
+          'messaging.destination.name': 'didcomm.delivery',
+          'messaging.operation.name': 'process',
+          'messaging.operation.type': 'process',
+          'didcomm.connection.id_hash': hashIdentifier(connectionId),
+        },
+      },
+      callback: async () => callback(),
+      record: (outcome, elapsed) => {
+        const attributes = { transport: 'redis', outcome }
+        deliveryCounter.add(1, attributes)
+        deliveryDuration.record(elapsed, attributes)
+      },
+    })
+  )
+}
 
 /**
  * Initialize redis message publishing for queued mediator messages. This message publishing implementation is not
@@ -46,12 +81,19 @@ export async function loadRedisMessageDelivery({
   abortSignal?: AbortSignal
   agent: MediatorAgent
   redisClient?: Redis.default
-}) {
-  if (config.cache.type !== 'redis' || config.messagePickup.multiInstanceDelivery.type !== 'redis') return
+}): Promise<() => Promise<void>> {
+  if (config.cache.type !== 'redis' || config.messagePickup.multiInstanceDelivery.type !== 'redis') {
+    return async () => {}
+  }
 
   agent.config.logger.info('Loading redis multi instance message delivery')
 
+  const ownsClient = redisClient === undefined
   const client = redisClient ?? new Redis.default(config.cache.redisUrl)
+  const shutdownController = new AbortController()
+  const deliverySignal = abortSignal
+    ? AbortSignal.any([abortSignal, shutdownController.signal])
+    : shutdownController.signal
 
   // We generate a random server instance, it does not really matter as long as it's unique between active servers
   // if a server crashes we lose the active socket connections.
@@ -92,7 +134,7 @@ export async function loadRedisMessageDelivery({
     MESSAGE_HANDLING_TIMEOUT_MS
   )
 
-  agent.events.on<DidcommMessageQueuedEvent>(MediatorEventTypes.DidCommMessageQueued, async (event) => {
+  const onMessageQueued = async (event: DidcommMessageQueuedEvent) => {
     const connectionId = event.payload.connectionId
 
     agent.config.logger.debug(
@@ -107,30 +149,42 @@ export async function loadRedisMessageDelivery({
           : routeOrNotify(queuedConnectionId),
       logger: agent.config.logger,
     })
-  })
+  }
+  agent.events.on<DidcommMessageQueuedEvent>(MediatorEventTypes.DidCommMessageQueued, onMessageQueued)
 
   // We want to send a push notification for all messages that were emitted on the stream but not handled
   // it probably means the socket was closed and thus not correctly handled.
-  void streamPublishing.claimPendingMessages(
+  const claimPendingMessagesTask = streamPublishing.claimPendingMessages(
     async (serverId, message) => {
-      agent.config.logger.debug(
-        `Server '${streamPublishing.serverId}' claimed pending message ${message.id} from server ${serverId}. Trying to send push notification.`
-      )
+      await consumeRedisDelivery(message.payload.connectionId, message.payload.telemetry, async () => {
+        agent.config.logger.debug(
+          `Server '${streamPublishing.serverId}' claimed pending message ${message.id} from server ${serverId}. Trying to send push notification.`
+        )
 
-      await sendNotification(agent.context, message.payload.connectionId)
+        await sendNotification(agent.context, message.payload.connectionId)
+      })
     },
-    { minIdleTimeMs: PENDING_MESSAGE_FAILOVER_MS, signal: abortSignal }
+    { minIdleTimeMs: PENDING_MESSAGE_FAILOVER_MS, signal: deliverySignal }
   )
 
   // First we want to try to send the message to an open socket connection. If that's not possible, we will emit a push notification.
-  void streamPublishing.listenForMessages(
+  const listenForMessagesTask = streamPublishing.listenForMessages(
     async (message) => {
-      agent.config.logger.debug(
-        `Server '${streamPublishing.serverId}' received message ${message.id} for connection '${message.payload.connectionId}'. Attempting to deliver to local session.`
-      )
+      await consumeRedisDelivery(message.payload.connectionId, message.payload.telemetry, async () => {
+        agent.config.logger.debug(
+          `Server '${streamPublishing.serverId}' received message ${message.id} for connection '${message.payload.connectionId}'. Attempting to deliver to local session.`
+        )
 
-      await deliveryCoordinator.schedule(message.payload.connectionId)
+        await deliveryCoordinator.schedule(message.payload.connectionId)
+      })
     },
-    { signal: abortSignal }
+    { signal: deliverySignal }
   )
+
+  return async () => {
+    agent.events.off<DidcommMessageQueuedEvent>(MediatorEventTypes.DidCommMessageQueued, onMessageQueued)
+    shutdownController.abort()
+    await Promise.allSettled([claimPendingMessagesTask, listenForMessagesTask])
+    if (ownsClient) await client.quit()
+  }
 }
