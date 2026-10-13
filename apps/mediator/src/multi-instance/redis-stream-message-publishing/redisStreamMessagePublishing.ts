@@ -48,7 +48,7 @@ export class RedisStreamMessagePublishing {
         agent.context.config.logger.info(`*** Session saved for connectionId: ${connectionId} ***`)
 
         try {
-          this.registerConnection(connectionId)
+          await this.registerConnection(connectionId)
         } catch (handlerError) {
           agent.context.config.logger.error(`Error handling LiveSessionSaved: ${handlerError}`)
         }
@@ -118,14 +118,16 @@ export class RedisStreamMessagePublishing {
         }
 
         const messages = this.parseStreamMessages(response)
-        for (const message of messages) {
-          try {
-            await handler(message)
-            await this.acknowledgeMessage(streamKey, message.id)
-          } catch (error) {
-            this.agent.config.logger.error(`Error processing message ${message.id}:`, { error })
-          }
-        }
+        await Promise.all(
+          messages.map(async (message) => {
+            try {
+              await handler(message)
+              await this.acknowledgeMessage(streamKey, message.id)
+            } catch (error) {
+              this.agent.config.logger.error(`Error processing message ${message.id}:`, { error })
+            }
+          })
+        )
       } catch (error) {
         this.agent.config.logger.error('Error reading from stream', { error })
       }
