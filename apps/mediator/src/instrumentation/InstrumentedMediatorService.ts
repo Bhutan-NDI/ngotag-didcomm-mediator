@@ -8,7 +8,7 @@ import {
   DidCommMediatorService,
 } from '@credo-ts/didcomm'
 
-import { config } from '../config.js'
+import { effectiveCredoMessageForwardingStrategy } from '../config.js'
 import {
   forwardCounter,
   forwardDuration,
@@ -33,7 +33,9 @@ export class InstrumentedMediatorService extends DidCommMediatorService {
   public override async processForwardMessage(
     messageContext: DidCommInboundMessageContext<DidCommForwardMessage>
   ): Promise<void> {
-    const strategy = config.messagePickup.forwardingStrategy
+    // Report what Credo actually runs: Redis multi-instance delivery may override
+    // the configured strategy (see resolveCredoMessageForwardingStrategy).
+    const strategy = effectiveCredoMessageForwardingStrategy
     await instrumentOperation('didcomm.forward', {
       span: {
         kind: SpanKind.INTERNAL,

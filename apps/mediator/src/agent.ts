@@ -23,7 +23,12 @@ import { ExtendedQueueTransportRepository, loadMessagePickupStorage } from './co
 import { loadPushNotificationSender } from './config/pushNotificationLoader.js'
 import { loadRedisMessageDelivery } from './config/redisMessageDeliveryLoader.js'
 import { loadStorage } from './config/storageLoader.js'
-import { config, logger } from './config.js'
+import {
+  config,
+  configuredMessageForwardingStrategy,
+  effectiveCredoMessageForwardingStrategy,
+  logger,
+} from './config.js'
 import { wireEventInstrumentation } from './instrumentation/eventInstrumentation.js'
 import { InstrumentedMediatorService } from './instrumentation/InstrumentedMediatorService.js'
 import { InstrumentedMessageReceiver } from './instrumentation/InstrumentedMessageReceiver.js'
@@ -72,7 +77,11 @@ async function createModules({
       },
       mediator: {
         autoAcceptMediationRequests: true,
-        messageForwardingStrategy: config.messagePickup.forwardingStrategy,
+        // With Redis multi-instance delivery, the Redis queue listener is the
+        // single owner of live delivery and fallback. Configuring Credo to
+        // queue only avoids a second, concurrent queue drain while preserving
+        // the application's QueueAndLiveModeDelivery behaviour.
+        messageForwardingStrategy: effectiveCredoMessageForwardingStrategy,
       },
 
       // Protocols not needed for mediator
@@ -114,6 +123,13 @@ export async function createAgent() {
   const socketServer = new WebSocketServer({ noServer: true })
   const redisClient = config.cache.type === 'redis' ? new Redis.default(config.cache.redisUrl) : undefined
   const abortController = new AbortController()
+
+  if (configuredMessageForwardingStrategy !== effectiveCredoMessageForwardingStrategy) {
+    logger.warn('Redis multi-instance delivery is taking ownership of live queued-message delivery.', {
+      configuredMessageForwardingStrategy,
+      effectiveCredoMessageForwardingStrategy,
+    })
+  }
 
   instrumentSocketServer(socketServer)
 
