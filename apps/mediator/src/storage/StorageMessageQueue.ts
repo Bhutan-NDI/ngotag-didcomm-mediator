@@ -1,4 +1,4 @@
-import { AgentContext, EventEmitter, utils } from '@credo-ts/core'
+import { AgentContext, EventEmitter, RecordNotFoundError, utils } from '@credo-ts/core'
 import type {
   AddMessageOptions,
   DidCommQueueTransportRepository,
@@ -7,30 +7,30 @@ import type {
   RemoveMessagesOptions,
   TakeFromQueueOptions,
 } from '@credo-ts/didcomm'
+import { assertValidClaimTtl, DEFAULT_MESSAGE_CLAIM_TTL_MS } from '@credo-ts/didcomm-transport-queue-dynamodb'
 import { DidcommMessageQueuedEvent, MediatorEventTypes } from '../events.js'
 import type { TelemetryCarrier } from '../telemetry/api.js'
+import type { MessageClaimLock } from './MessageClaimLock.js'
 import { MessageRecord } from './MessageRecord.js'
 import { MessageRepository } from './MessageRepository.js'
 
-/**
- * How long a message taken from the queue stays claimed before it becomes available again, if the delivery is never
- * acknowledged (e.g. the holder went offline before sending messages-received).
- */
-export const DEFAULT_MESSAGE_CLAIM_TTL_MS = 30_000
-
 export interface StorageServiceMessageQueueOptions {
   claimTtlMs?: number
+  /** Cross-instance claim arbiter. Without it, claims only hold within this instance. */
+  claimLock?: MessageClaimLock
 }
 
 export class StorageServiceMessageQueue implements DidCommQueueTransportRepository {
   private readonly claimTtlMs: number
+  private readonly claimLock?: MessageClaimLock
 
-  // Tail of the in-flight takeFromQueue chain per connection, so the read-then-claim below is not interleaved
-  // with another take for the same connection on this instance.
+  // Tail of the in-flight take per connection, so this instance's read-then-claim never interleaves.
   private readonly connectionTakeQueues = new Map<string, Promise<void>>()
 
   public constructor(options: StorageServiceMessageQueueOptions = {}) {
     this.claimTtlMs = options.claimTtlMs ?? DEFAULT_MESSAGE_CLAIM_TTL_MS
+    assertValidClaimTtl(this.claimTtlMs)
+    this.claimLock = options.claimLock
   }
 
   // Aggregate queue-depth stats for OpenTelemetry observable gauges.
@@ -45,8 +45,6 @@ export class StorageServiceMessageQueue implements DidCommQueueTransportReposito
     const messageRepository = agentContext.resolve(MessageRepository)
     const messageRecords = await messageRepository.findByConnectionId(agentContext, connectionId)
 
-    // Messages claimed by an in-flight delivery are not available, matching Credo's in-memory queue which only
-    // counts 'pending' messages.
     const now = Date.now()
     const availableCount = messageRecords.filter((messageRecord) => !messageRecord.isClaimed(now)).length
 
@@ -77,9 +75,7 @@ export class StorageServiceMessageQueue implements DidCommQueueTransportReposito
     const messageRepository = agentContext.resolve(MessageRepository)
     const messageRecords = await messageRepository.findByConnectionId(agentContext, connectionId)
 
-    // Skip messages another delivery has taken but not yet had acknowledged. Without this, two pickup v2
-    // delivery-requests (or a delivery-request and a live-mode drain) arriving before the holder's
-    // messages-received would both return the same messages, since v2 only deletes on acknowledgement.
+    // Both pickup versions skip messages another delivery holds.
     const now = Date.now()
     const availableRecords = messageRecords.filter((messageRecord) => !messageRecord.isClaimed(now))
 
@@ -90,21 +86,19 @@ export class StorageServiceMessageQueue implements DidCommQueueTransportReposito
       } available, ${messageRecords.length} total) with deleteMessages=${String(deleteMessages)}`
     )
 
-    const messageRecordsToReturn = availableRecords.slice(0, messagesToTake)
+    const wonRecords = await this.lockRecords(availableRecords, messagesToTake)
 
+    let messageRecordsToReturn: MessageRecord[]
     if (deleteMessages) {
-      await this.removeMessages(agentContext, {
-        connectionId,
-        messageIds: messageRecordsToReturn.map((msg) => msg.id),
-      })
+      messageRecordsToReturn = await this.keepExisting(wonRecords, (messageRecord) =>
+        messageRepository.deleteById(agentContext, messageRecord.id)
+      )
     } else {
       const claimedUntil = now + this.claimTtlMs
-      await Promise.all(
-        messageRecordsToReturn.map((messageRecord) => {
-          messageRecord.claimedUntil = claimedUntil
-          return messageRepository.update(agentContext, messageRecord)
-        })
-      )
+      messageRecordsToReturn = await this.keepExisting(wonRecords, (messageRecord) => {
+        messageRecord.claimedUntil = claimedUntil
+        return messageRepository.update(agentContext, messageRecord)
+      })
     }
 
     const queuedMessages = messageRecordsToReturn.map((messageRecord) => ({
@@ -115,6 +109,36 @@ export class StorageServiceMessageQueue implements DidCommQueueTransportReposito
     }))
 
     return queuedMessages
+  }
+
+  /** Takes up to count records, in queue order, that the claim lock grants to this instance. */
+  private async lockRecords(records: MessageRecord[], count: number): Promise<MessageRecord[]> {
+    if (!this.claimLock) return records.slice(0, count)
+
+    const won: MessageRecord[] = []
+    for (let start = 0; start < records.length && won.length < count; ) {
+      const batch = records.slice(start, start + count - won.length)
+      start += batch.length
+      const results = await this.claimLock.tryClaim(
+        batch.map((record) => record.id),
+        this.claimTtlMs
+      )
+      won.push(...batch.filter((_, index) => results[index]))
+    }
+    return won
+  }
+
+  /** Applies write to each record, dropping records acknowledged (deleted) since they were read. */
+  private async keepExisting(
+    records: MessageRecord[],
+    write: (record: MessageRecord) => Promise<unknown>
+  ): Promise<MessageRecord[]> {
+    const results = await Promise.allSettled(records.map(write))
+    const failure = results.find(
+      (result) => result.status === 'rejected' && !(result.reason instanceof RecordNotFoundError)
+    )
+    if (failure?.status === 'rejected') throw failure.reason
+    return records.filter((_, index) => results[index].status === 'fulfilled')
   }
 
   private async serializePerConnection<T>(key: string, task: () => Promise<T>): Promise<T> {

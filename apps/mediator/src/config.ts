@@ -1,5 +1,6 @@
 import { LogLevel } from '@credo-ts/core'
 import { DidCommMessageForwardingStrategy } from '@credo-ts/didcomm'
+import { DEFAULT_MESSAGE_CLAIM_TTL_MS } from '@credo-ts/didcomm-transport-queue-dynamodb'
 import { z } from 'zod/v4'
 import { $ZodError } from 'zod/v4/core'
 import { loadConfigSync } from 'zod-config'
@@ -7,6 +8,8 @@ import { envAdapter } from 'zod-config/env-adapter'
 import { jsonAdapter } from 'zod-config/json-adapter'
 import { Logger } from './logger/index.js'
 import { resolveCredoMessageForwardingStrategy } from './message-delivery/resolveCredoMessageForwardingStrategy.js'
+
+const claimTtlError = `Message pickup claim TTL must be a positive integer number of milliseconds. Defaults to ${DEFAULT_MESSAGE_CLAIM_TTL_MS}. Can also be set using 'MESSAGE_PICKUP__CLAIM_TTL_MS' environment variable`
 
 const zFirebaseProjects = z.array(
   z.object({
@@ -233,22 +236,12 @@ const zConfig = z
           .default({
             type: 'credo',
           }),
-        // How long a message taken by a pickup v2 delivery stays claimed before it is delivered again, if the holder
-        // never acknowledges it with messages-received. Applies to the 'credo' and 'dynamodb' storage types.
+        // Lease for a taken but unacknowledged message ('credo' and 'dynamodb' storage).
         claimTtlMs: z.coerce
-          .number({
-            error:
-              "Message pickup claim TTL must be a positive integer number of milliseconds. Defaults to 30000. Can also be set using 'MESSAGE_PICKUP__CLAIM_TTL_MS' environment variable",
-          })
-          .int({
-            error:
-              "Message pickup claim TTL must be a positive integer number of milliseconds. Defaults to 30000. Can also be set using 'MESSAGE_PICKUP__CLAIM_TTL_MS' environment variable",
-          })
-          .positive({
-            error:
-              "Message pickup claim TTL must be a positive integer number of milliseconds. Defaults to 30000. Can also be set using 'MESSAGE_PICKUP__CLAIM_TTL_MS' environment variable",
-          })
-          .default(30_000),
+          .number({ error: claimTtlError })
+          .int({ error: claimTtlError })
+          .positive({ error: claimTtlError })
+          .default(DEFAULT_MESSAGE_CLAIM_TTL_MS),
         multiInstanceDelivery: z
           .discriminatedUnion(
             'type',
@@ -274,7 +267,7 @@ const zConfig = z
         storage: {
           type: 'credo',
         },
-        claimTtlMs: 30_000,
+        claimTtlMs: DEFAULT_MESSAGE_CLAIM_TTL_MS,
         multiInstanceDelivery: {
           type: 'none',
         },

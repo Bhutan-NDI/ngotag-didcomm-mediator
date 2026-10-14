@@ -1,5 +1,6 @@
 import { BaseRecord, utils } from '@credo-ts/core'
 import type { DidCommEncryptedMessage } from '@credo-ts/didcomm'
+import { isClaimed } from '@credo-ts/didcomm-transport-queue-dynamodb'
 import type { TelemetryCarrier } from '../telemetry/api.js'
 
 export type DefaultMessageRecordTags = {
@@ -20,11 +21,7 @@ export class MessageRecord extends BaseRecord<DefaultMessageRecordTags> implemen
   public message!: DidCommEncryptedMessage
   public telemetry?: TelemetryCarrier
 
-  /**
-   * Epoch milliseconds until which this message is claimed by an in-flight delivery. While claimed it is not
-   * returned by `takeFromQueue`; if the delivery is never acknowledged the claim lapses and the message becomes
-   * available again.
-   */
+  /** Epoch milliseconds until which an in-flight delivery holds this message. */
   public claimedUntil?: number
 
   public static override readonly type = 'MessageRecord'
@@ -43,7 +40,7 @@ export class MessageRecord extends BaseRecord<DefaultMessageRecordTags> implemen
   }
 
   public isClaimed(now: number = Date.now()) {
-    return this.claimedUntil !== undefined && this.claimedUntil > now
+    return isClaimed(this.claimedUntil, now)
   }
 
   public getTags() {
