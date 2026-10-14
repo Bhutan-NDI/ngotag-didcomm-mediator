@@ -136,7 +136,7 @@ export async function createAgent() {
 
   // Wrap whichever pickup-queue backend is configured (credo | postgres | dynamodb)
   // so queue operations have the same telemetry regardless of backend.
-  const baseQueueTransportRepository = await loadMessagePickupStorage()
+  const baseQueueTransportRepository = await loadMessagePickupStorage({ redisClient })
   const queueTransportRepository = new InstrumentedQueueTransportRepository(
     baseQueueTransportRepository,
     config.messagePickup.storage.type

@@ -19,6 +19,7 @@ import {
 import { marshall, unmarshall } from '@aws-sdk/util-dynamodb'
 import { Logger } from '@credo-ts/core'
 import { DidCommEncryptedMessage } from '@credo-ts/didcomm'
+import { assertValidClaimTtl, DEFAULT_MESSAGE_CLAIM_TTL_MS, isClaimed } from './claim.js'
 import {
   attributeDefinitions,
   keySchema,
@@ -45,11 +46,23 @@ export type DynamoDbClientRepositoryOptions = DynamoDBClientConfigType & {
   tableName?: string
   /** @default <tableName>_recipient_index */
   recipientIndexTableName?: string
+  /** Lease for a taken but unacknowledged message. @default 30000 */
+  claimTtlMs?: number
   logger: Logger
 }
 
 type RecipientIndexMetadata = { cutoverMessageId: number }
 type RecipientIndexEntry = { messageId: string }
+
+// Matches messages no delivery currently holds. Needs ':now' in the expression values.
+const UNCLAIMED_FILTER = '(attribute_not_exists(claimedUntil) OR claimedUntil <= :now)'
+// Claim writes in flight per take, so a large take cannot exhaust the table's write capacity at once.
+const CLAIM_CONCURRENCY = 10
+// Minimum page size for claim-filtered queries. Limit applies before the filter, so a limit-sized page shrinks to
+// nothing behind claimed messages, while an unbounded one evaluates (and is charged for) up to 1 MB.
+const QUERY_PAGE_SIZE = 100
+// Upper bound on read rounds per take, in case reads keep returning messages it cannot claim.
+const MAX_TAKE_ROUNDS = 10
 
 const RECIPIENT_INDEX_METADATA_KEY = '__recipient_index_metadata__'
 const RECIPIENT_INDEX_PREFIX = 'r#'
@@ -71,12 +84,16 @@ export class DynamoDbClientRepository {
   private dynamodbClient: DynamoDBClient
   private tableName: string
   private recipientIndexTableName: string
+  private claimTtlMs: number
   private logger: Logger
 
   private constructor(options: DynamoDbClientRepositoryOptions) {
-    this.dynamodbClient = new DynamoDBClient(options)
+    const { claimTtlMs = DEFAULT_MESSAGE_CLAIM_TTL_MS, ...clientOptions } = options
+    assertValidClaimTtl(claimTtlMs)
+    this.dynamodbClient = new DynamoDBClient(clientOptions)
     this.tableName = options.tableName ?? 'queued_messages'
     this.recipientIndexTableName = options.recipientIndexTableName ?? `${this.tableName}_recipient_index`
+    this.claimTtlMs = claimTtlMs
     this.logger = options.logger
   }
 
@@ -276,23 +293,29 @@ export class DynamoDbClientRepository {
     }
   }
 
+  /** Counts messages that are not claimed by an in-flight delivery. */
   async getMessageCount(connectionId: string, recipientDid?: string, maximumCount?: number): Promise<number> {
+    const now = Date.now()
     try {
-      if (recipientDid === undefined) return await this.countMessagesByConnection(connectionId, maximumCount)
+      if (recipientDid === undefined) return await this.countMessagesByConnection(connectionId, now, maximumCount)
 
       const metadata = await this.getRecipientIndexMetadataForRead(connectionId)
-      if (!metadata) return await this.countLegacyRecipientMessages(connectionId, recipientDid, undefined, maximumCount)
+      if (!metadata) {
+        return await this.countLegacyRecipientMessages(connectionId, recipientDid, now, undefined, maximumCount)
+      }
 
       const indexed = await this.countIndexedRecipientMessages(
         connectionId,
         recipientDid,
         metadata.cutoverMessageId,
+        now,
         maximumCount
       )
       if (maximumCount !== undefined && indexed >= maximumCount) return maximumCount
       const legacy = await this.countLegacyRecipientMessages(
         connectionId,
         recipientDid,
+        now,
         metadata.cutoverMessageId,
         maximumCount === undefined ? undefined : maximumCount - indexed
       )
@@ -303,12 +326,13 @@ export class DynamoDbClientRepository {
     }
   }
 
-  private async countMessagesByConnection(connectionId: string, maximumCount?: number): Promise<number> {
+  private async countMessagesByConnection(connectionId: string, now: number, maximumCount?: number): Promise<number> {
     return this.countQuery(
       {
         TableName: this.tableName,
         KeyConditionExpression: 'connectionId = :connectionId',
-        ExpressionAttributeValues: { ':connectionId': { S: connectionId } },
+        FilterExpression: UNCLAIMED_FILTER,
+        ExpressionAttributeValues: { ':connectionId': { S: connectionId }, ':now': { N: String(now) } },
       },
       maximumCount
     )
@@ -318,6 +342,7 @@ export class DynamoDbClientRepository {
     connectionId: string,
     recipientDid: string,
     cutoverMessageId: number,
+    now: number,
     maximumCount?: number
   ): Promise<number> {
     return this.countQuery(
@@ -325,8 +350,10 @@ export class DynamoDbClientRepository {
         TableName: this.recipientIndexTableName,
         KeyConditionExpression:
           'connectionId = :connectionId AND recipientMessageId BETWEEN :recipientIndexStart AND :recipientIndexEnd',
+        FilterExpression: UNCLAIMED_FILTER,
         ExpressionAttributeValues: {
           ':connectionId': { S: connectionId },
+          ':now': { N: String(now) },
           ...this.recipientIndexRange(recipientDid, cutoverMessageId),
         },
       },
@@ -337,23 +364,33 @@ export class DynamoDbClientRepository {
   private async countLegacyRecipientMessages(
     connectionId: string,
     recipientDid: string,
+    now: number,
     cutoverMessageId?: number,
     maximumCount?: number
   ): Promise<number> {
-    const params: QueryCommandInput = {
+    return this.countQuery(this.legacyRecipientQuery(connectionId, recipientDid, now, cutoverMessageId), maximumCount)
+  }
+
+  private legacyRecipientQuery(
+    connectionId: string,
+    recipientDid: string,
+    now: number,
+    cutoverMessageId?: number
+  ): QueryCommandInput {
+    return {
       TableName: this.tableName,
       KeyConditionExpression:
         cutoverMessageId === undefined
           ? 'connectionId = :connectionId'
           : 'connectionId = :connectionId AND messageId <= :cutoverMessageId',
-      FilterExpression: 'contains(recipientDids, :recipientDid)',
+      FilterExpression: `contains(recipientDids, :recipientDid) AND ${UNCLAIMED_FILTER}`,
       ExpressionAttributeValues: {
         ':connectionId': { S: connectionId },
         ':recipientDid': { S: recipientDid },
+        ':now': { N: String(now) },
         ...(cutoverMessageId === undefined ? {} : { ':cutoverMessageId': { N: String(cutoverMessageId) } }),
       },
     }
-    return this.countQuery(params, maximumCount)
   }
 
   private async countQuery(params: QueryCommandInput, maximumCount?: number): Promise<number> {
@@ -365,10 +402,7 @@ export class DynamoDbClientRepository {
         new QueryCommand({
           ...params,
           Select: 'COUNT',
-          // DynamoDB applies Limit before FilterExpression. Limiting a sparse
-          // legacy recipient query to (for example) 10 evaluated items would
-          // create many tiny pages, so filtered queries retain full pages.
-          Limit: maximumCount === undefined || params.FilterExpression !== undefined ? undefined : maximumCount - count,
+          Limit: maximumCount === undefined ? undefined : Math.max(maximumCount - count, QUERY_PAGE_SIZE),
           ExclusiveStartKey: lastEvaluatedKey,
         })
       )
@@ -386,12 +420,11 @@ export class DynamoDbClientRepository {
     recipientDid?: string
     deleteMessages?: boolean
   }) {
-    const messages =
-      options.recipientDid === undefined
-        ? await this.getMessagesByConnection(options.connectionId, options.limit)
-        : await this.getRecipientMessages(options.connectionId, options.recipientDid, options.limit)
+    // Pickup v1 claims too, so it cannot return (and delete) messages a v2 delivery currently holds.
+    const messages = await this.claimMessages(options)
+    if (!options.deleteMessages) return messages
 
-    if (options.deleteMessages && messages.length > 0) {
+    if (messages.length > 0) {
       try {
         await this.removeMessages({
           connectionId: options.connectionId,
@@ -413,35 +446,231 @@ export class DynamoDbClientRepository {
     return messages
   }
 
-  private async getMessagesByConnection(connectionId: string, limit?: number): Promise<QueuedMessage[]> {
-    const response = await this.dynamodbClient.send(
-      new QueryCommand({
-        TableName: this.tableName,
-        KeyConditionExpression: 'connectionId = :connectionId',
-        ExpressionAttributeValues: { ':connectionId': { S: connectionId } },
-        Limit: limit,
+  /**
+   * Claims each returned message with a conditional write, so overlapping takes on any instance never return the
+   * same message. An unacknowledged claim lapses after claimTtlMs and the message is delivered again.
+   */
+  private async claimMessages(options: {
+    connectionId: string
+    limit?: number
+    recipientDid?: string
+  }): Promise<QueuedMessage[]> {
+    const { connectionId, recipientDid, limit } = options
+    // Without metadata (unreadable or not yet written) claims stay on the canonical table, which still arbitrates;
+    // only the recipient count may read high until those leases lapse.
+    const metadata = await this.getRecipientIndexMetadataForRead(connectionId)
+    const claimed: Array<{ message: QueuedMessage; claimedUntil: number }> = []
+    // Messages the server filter passes but whose canonical record is claimed (a claim that missed the index). They
+    // keep coming back, so later reads ask for that many more and they cannot crowd out free messages behind them.
+    const heldElsewhere = new Set<string>()
+    // Messages this take already tried to claim. Won or lost, they are claimed now, so reads do not return them.
+    const attempted = new Set<string>()
+
+    for (let round = 0; round < MAX_TAKE_ROUNDS && (limit === undefined || claimed.length < limit); round++) {
+      const now = Date.now()
+      const needed = limit === undefined ? undefined : limit - claimed.length
+      const wanted = needed === undefined ? undefined : needed + heldElsewhere.size
+      const found = await this.findUnclaimedMessages(connectionId, recipientDid, metadata, now, wanted)
+      for (const message of found) if (isClaimed(message.claimedUntil, now)) heldElsewhere.add(message.id)
+      const available = found.filter((message) => !heldElsewhere.has(message.id) && !attempted.has(message.id))
+      const candidates = needed === undefined ? available : available.slice(0, needed)
+
+      if (candidates.length > 0) {
+        const claimedUntil = now + this.claimTtlMs
+        for (const message of candidates) attempted.add(message.id)
+        const results = await this.settleWithConcurrency(candidates, (message) =>
+          this.claimMessage(connectionId, message, metadata, now, claimedUntil)
+        )
+        candidates.forEach((message, index) => {
+          const result = results[index]
+          if (result.status === 'fulfilled' && result.value) claimed.push({ message, claimedUntil })
+        })
+
+        const failure = results.find((result) => result.status === 'rejected')
+        if (failure) {
+          // Release what this take won, so a failed take does not hide those messages for a whole lease.
+          await this.releaseClaims(connectionId, claimed, metadata)
+          throw failure.reason
+        }
+      }
+
+      // Fewer than requested means the read reached the end of the queue.
+      if (wanted === undefined || found.length < wanted) break
+    }
+
+    return claimed.map(({ message: { claimedUntil: _claimedUntil, ...message } }) => message)
+  }
+
+  /** Resolves false when another delivery holds the message or it was acknowledged since it was read. */
+  private async claimMessage(
+    connectionId: string,
+    message: QueuedMessage,
+    metadata: RecipientIndexMetadata | undefined,
+    now: number,
+    claimedUntil: number
+  ): Promise<boolean> {
+    try {
+      await this.writeClaim(connectionId, message, metadata, {
+        UpdateExpression: 'SET claimedUntil = :claimedUntil',
+        // attribute_exists stops the update from recreating an acknowledged message.
+        ConditionExpression: `attribute_exists(messageId) AND ${UNCLAIMED_FILTER}`,
+        values: { ':claimedUntil': claimedUntil, ':now': now },
+      })
+      return true
+    } catch (error) {
+      if (this.isConditionalCheckFailure(error)) return false
+      throw error
+    }
+  }
+
+  private async releaseClaims(
+    connectionId: string,
+    claims: Array<{ message: QueuedMessage; claimedUntil: number }>,
+    metadata: RecipientIndexMetadata | undefined
+  ): Promise<void> {
+    const results = await this.settleWithConcurrency(claims, ({ message, claimedUntil }) =>
+      this.writeClaim(connectionId, message, metadata, {
+        UpdateExpression: 'REMOVE claimedUntil',
+        // Only release a claim this take still holds.
+        ConditionExpression: 'claimedUntil = :claimedUntil',
+        values: { ':claimedUntil': claimedUntil },
       })
     )
-    return this.toQueuedMessages(response.Items)
+    for (const result of results) {
+      if (result.status === 'rejected' && !this.isConditionalCheckFailure(result.reason)) {
+        this.logger.warn('Unable to release a message claim; it lapses after the claim TTL', {
+          connectionId,
+          error: result.reason,
+        })
+      }
+    }
+  }
+
+  /** Updates the canonical item, mirroring the update onto its recipient index entries when it is indexed. */
+  private async writeClaim(
+    connectionId: string,
+    message: QueuedMessage,
+    metadata: RecipientIndexMetadata | undefined,
+    update: { UpdateExpression: string; ConditionExpression: string; values: Record<string, number> }
+  ): Promise<void> {
+    const canonicalUpdate = {
+      TableName: this.tableName,
+      Key: marshall({ connectionId, messageId: Number(message.id) }),
+      UpdateExpression: update.UpdateExpression,
+      ConditionExpression: update.ConditionExpression,
+      ExpressionAttributeValues: marshall(update.values),
+    }
+    if (!this.isIndexedMessage(message.id, metadata)) {
+      await this.sendWithRetry('UpdateItem', () => this.dynamodbClient.send(new UpdateItemCommand(canonicalUpdate)))
+      return
+    }
+
+    const isRelease = update.UpdateExpression.startsWith('REMOVE')
+    await this.transactWriteItemsWithRetry({
+      TransactItems: [
+        { Update: canonicalUpdate },
+        ...[...new Set(message.recipientDids)].map((recipientDid) => ({
+          Update: {
+            TableName: this.recipientIndexTableName,
+            Key: marshall({ connectionId, recipientMessageId: this.recipientIndexSortKey(recipientDid, message.id) }),
+            UpdateExpression: update.UpdateExpression,
+            ConditionExpression: 'attribute_exists(recipientMessageId)',
+            ExpressionAttributeValues: isRelease
+              ? undefined
+              : marshall({ ':claimedUntil': update.values[':claimedUntil'] }),
+          },
+        })),
+      ],
+    })
+  }
+
+  private isIndexedMessage(messageId: string, metadata: RecipientIndexMetadata | undefined): boolean {
+    return metadata !== undefined && Number(messageId) > metadata.cutoverMessageId
+  }
+
+  private isConditionalCheckFailure(error: unknown): boolean {
+    if (!(error instanceof Error)) return false
+    if (error.name === 'ConditionalCheckFailedException') return true
+    if (error.name !== 'TransactionCanceledException') return false
+    const reasons = (error as Error & { CancellationReasons?: Array<{ Code?: string }> }).CancellationReasons
+    return reasons
+      ? reasons.some((reason) => reason.Code === 'ConditionalCheckFailed')
+      : error.message.includes('ConditionalCheckFailed')
+  }
+
+  /** Runs task for every item with at most CLAIM_CONCURRENCY in flight, settling all of them. */
+  private async settleWithConcurrency<T, R>(
+    items: T[],
+    task: (item: T) => Promise<R>
+  ): Promise<PromiseSettledResult<R>[]> {
+    const results: PromiseSettledResult<R>[] = new Array(items.length)
+    let next = 0
+    const worker = async () => {
+      while (next < items.length) {
+        const index = next++
+        try {
+          results[index] = { status: 'fulfilled', value: await task(items[index]) }
+        } catch (reason) {
+          results[index] = { status: 'rejected', reason }
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(CLAIM_CONCURRENCY, items.length) }, worker))
+    return results
+  }
+
+  // Strongly consistent reads, so a message claimed by another take is never offered again.
+  private async findUnclaimedMessages(
+    connectionId: string,
+    recipientDid: string | undefined,
+    metadata: RecipientIndexMetadata | undefined,
+    now: number,
+    limit?: number
+  ): Promise<QueuedMessage[]> {
+    return recipientDid === undefined
+      ? await this.getMessagesByConnection(connectionId, now, limit)
+      : await this.getRecipientMessages(connectionId, recipientDid, metadata, now, limit)
+  }
+
+  private async getMessagesByConnection(connectionId: string, now: number, limit?: number): Promise<QueuedMessage[]> {
+    return this.queryMessages(
+      {
+        TableName: this.tableName,
+        KeyConditionExpression: 'connectionId = :connectionId',
+        FilterExpression: UNCLAIMED_FILTER,
+        ExpressionAttributeValues: { ':connectionId': { S: connectionId }, ':now': { N: String(now) } },
+        ConsistentRead: true,
+        Limit: limit === undefined ? undefined : Math.max(limit, QUERY_PAGE_SIZE),
+      },
+      limit
+    )
   }
 
   private async getRecipientMessages(
     connectionId: string,
     recipientDid: string,
+    metadata: RecipientIndexMetadata | undefined,
+    now: number,
     limit?: number
   ): Promise<QueuedMessage[]> {
-    const metadata = await this.getRecipientIndexMetadataForRead(connectionId)
-    if (!metadata) return await this.getLegacyRecipientMessages(connectionId, recipientDid, undefined, limit)
+    if (!metadata) return await this.getLegacyRecipientMessages(connectionId, recipientDid, now, undefined, limit)
 
     // Old messages sort before the post-cutover indexed entries, so read them
     // first to retain the queue's FIFO ordering while they drain.
-    const legacy = await this.getLegacyRecipientMessages(connectionId, recipientDid, metadata.cutoverMessageId, limit)
+    const legacy = await this.getLegacyRecipientMessages(
+      connectionId,
+      recipientDid,
+      now,
+      metadata.cutoverMessageId,
+      limit
+    )
     if (limit !== undefined && legacy.length >= limit) return legacy
 
     const indexed = await this.getIndexedRecipientMessages(
       connectionId,
       recipientDid,
       metadata.cutoverMessageId,
+      now,
       limit === undefined ? undefined : limit - legacy.length
     )
     return [...legacy, ...indexed]
@@ -450,32 +679,24 @@ export class DynamoDbClientRepository {
   private async getLegacyRecipientMessages(
     connectionId: string,
     recipientDid: string,
+    now: number,
     cutoverMessageId?: number,
     limit?: number
   ): Promise<QueuedMessage[]> {
-    const queryParams: QueryCommandInput = {
-      TableName: this.tableName,
-      KeyConditionExpression:
-        cutoverMessageId === undefined
-          ? 'connectionId = :connectionId'
-          : 'connectionId = :connectionId AND messageId <= :cutoverMessageId',
-      FilterExpression: 'contains(recipientDids, :recipientDid)',
-      ExpressionAttributeValues: {
-        ':connectionId': { S: connectionId },
-        ':recipientDid': { S: recipientDid },
-        ...(cutoverMessageId === undefined ? {} : { ':cutoverMessageId': { N: String(cutoverMessageId) } }),
-      },
-    }
-    return this.queryMessages(queryParams, limit)
+    return this.queryMessages(
+      { ...this.legacyRecipientQuery(connectionId, recipientDid, now, cutoverMessageId), ConsistentRead: true },
+      limit
+    )
   }
 
   private async getIndexedRecipientMessages(
     connectionId: string,
     recipientDid: string,
     cutoverMessageId: number,
+    now: number,
     limit?: number
   ): Promise<QueuedMessage[]> {
-    const indexEntries = await this.queryRecipientIndex(connectionId, recipientDid, cutoverMessageId, limit)
+    const indexEntries = await this.queryRecipientIndex(connectionId, recipientDid, cutoverMessageId, now, limit)
     if (indexEntries.length === 0) return []
     const messages = await this.batchGetMessages(
       connectionId,
@@ -496,6 +717,7 @@ export class DynamoDbClientRepository {
     connectionId: string,
     recipientDid: string,
     cutoverMessageId: number,
+    now: number,
     limit?: number
   ): Promise<RecipientIndexEntry[]> {
     const entries: RecipientIndexEntry[] = []
@@ -507,12 +729,15 @@ export class DynamoDbClientRepository {
           TableName: this.recipientIndexTableName,
           KeyConditionExpression:
             'connectionId = :connectionId AND recipientMessageId BETWEEN :recipientIndexStart AND :recipientIndexEnd',
+          FilterExpression: UNCLAIMED_FILTER,
           ExpressionAttributeValues: {
             ':connectionId': { S: connectionId },
+            ':now': { N: String(now) },
             ...this.recipientIndexRange(recipientDid, cutoverMessageId),
           },
           ProjectionExpression: 'messageId',
-          Limit: limit === undefined ? undefined : limit - entries.length,
+          ConsistentRead: true,
+          Limit: limit === undefined ? undefined : Math.max(limit - entries.length, QUERY_PAGE_SIZE),
           ExclusiveStartKey: lastEvaluatedKey,
         })
       )
@@ -522,7 +747,7 @@ export class DynamoDbClientRepository {
         this.assertPaginationAdvanced(previousLastEvaluatedKey, lastEvaluatedKey, this.recipientIndexTableName)
       }
     } while (lastEvaluatedKey && (limit === undefined || entries.length < limit))
-    return entries
+    return limit === undefined ? entries : entries.slice(0, limit)
   }
 
   private async queryMessages(params: QueryCommandInput, limit?: number): Promise<QueuedMessage[]> {
@@ -664,9 +889,8 @@ export class DynamoDbClientRepository {
     const transactionBatches: TransactWriteItem[][] = []
     let currentBatch: TransactWriteItem[] = []
     for (const message of messages) {
-      const isIndexedMessage = metadata !== undefined && Number(message.id) > metadata.cutoverMessageId
       const messageDeletes: TransactWriteItem[] = [
-        ...(isIndexedMessage
+        ...(this.isIndexedMessage(message.id, metadata)
           ? [...new Set(message.recipientDids)].map((recipientDid) => ({
               Delete: {
                 TableName: this.recipientIndexTableName,
@@ -717,14 +941,18 @@ export class DynamoDbClientRepository {
   }
 
   private async transactWriteItemsWithRetry(input: TransactWriteItemsCommandInput): Promise<void> {
+    await this.sendWithRetry('TransactWriteItems', () => this.dynamodbClient.send(new TransactWriteItemsCommand(input)))
+  }
+
+  /** Retries throttling and transient transaction failures with capped, jittered backoff. */
+  private async sendWithRetry<T>(operation: string, send: () => Promise<T>): Promise<T> {
     let retryAttempt = 0
     while (true) {
       try {
-        await this.dynamodbClient.send(new TransactWriteItemsCommand(input))
-        return
+        return await send()
       } catch (error) {
         if (!this.isRetryableTransactionError(error)) throw error
-        await this.waitBeforeRetry('TransactWriteItems', retryAttempt++, error)
+        await this.waitBeforeRetry(operation, retryAttempt++, error)
       }
     }
   }

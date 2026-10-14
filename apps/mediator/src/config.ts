@@ -7,6 +7,9 @@ import { envAdapter } from 'zod-config/env-adapter'
 import { jsonAdapter } from 'zod-config/json-adapter'
 import { Logger } from './logger/index.js'
 import { resolveCredoMessageForwardingStrategy } from './message-delivery/resolveCredoMessageForwardingStrategy.js'
+import { DEFAULT_MESSAGE_CLAIM_TTL_MS } from './storage/claim.js'
+
+const claimTtlError = `Message pickup claim TTL must be a positive integer number of milliseconds. Defaults to ${DEFAULT_MESSAGE_CLAIM_TTL_MS}. Can also be set using 'MESSAGE_PICKUP__CLAIM_TTL_MS' environment variable`
 
 const zFirebaseProjects = z.array(
   z.object({
@@ -233,6 +236,12 @@ const zConfig = z
           .default({
             type: 'credo',
           }),
+        // Lease for a taken but unacknowledged message ('credo' and 'dynamodb' storage).
+        claimTtlMs: z.coerce
+          .number({ error: claimTtlError })
+          .int({ error: claimTtlError })
+          .positive({ error: claimTtlError })
+          .default(DEFAULT_MESSAGE_CLAIM_TTL_MS),
         multiInstanceDelivery: z
           .discriminatedUnion(
             'type',
@@ -258,6 +267,7 @@ const zConfig = z
         storage: {
           type: 'credo',
         },
+        claimTtlMs: DEFAULT_MESSAGE_CLAIM_TTL_MS,
         multiInstanceDelivery: {
           type: 'none',
         },
