@@ -24,6 +24,7 @@ function logInvitationUrl(agent: MediatorAgent, outOfBandRecord: DidCommOutOfBan
 
 async function createMediatorInvitation(agent: MediatorAgent) {
   return agent.didcomm.oob.createInvitation({
+    label: config.agentName,
     multiUseInvitation: true,
     goalCode: config.invitationGoalCode,
     goal: 'Mediator Invitation',
