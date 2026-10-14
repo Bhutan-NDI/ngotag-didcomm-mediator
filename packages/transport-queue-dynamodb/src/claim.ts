@@ -1,4 +1,4 @@
-// Lease rules for pickup v2 claims, shared by every queue backend so they stay consistent.
+// Lease rules for pickup v2 claims in this package. The mediator passes claimTtlMs explicitly.
 
 /** How long a taken but unacknowledged message stays hidden from other takes. */
 export const DEFAULT_MESSAGE_CLAIM_TTL_MS = 30_000

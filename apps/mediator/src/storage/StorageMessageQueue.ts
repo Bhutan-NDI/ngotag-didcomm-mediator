@@ -7,9 +7,9 @@ import type {
   RemoveMessagesOptions,
   TakeFromQueueOptions,
 } from '@credo-ts/didcomm'
-import { assertValidClaimTtl, DEFAULT_MESSAGE_CLAIM_TTL_MS } from '@credo-ts/didcomm-transport-queue-dynamodb'
 import { DidcommMessageQueuedEvent, MediatorEventTypes } from '../events.js'
 import type { TelemetryCarrier } from '../telemetry/api.js'
+import { assertValidClaimTtl, DEFAULT_MESSAGE_CLAIM_TTL_MS } from './claim.js'
 import type { MessageClaimLock } from './MessageClaimLock.js'
 import { MessageRecord } from './MessageRecord.js'
 import { MessageRepository } from './MessageRepository.js'
@@ -86,19 +86,26 @@ export class StorageServiceMessageQueue implements DidCommQueueTransportReposito
       } available, ${messageRecords.length} total) with deleteMessages=${String(deleteMessages)}`
     )
 
-    const wonRecords = await this.lockRecords(availableRecords, messagesToTake)
+    // One deadline for the lock and the record, so both lapse at the same instant.
+    const claimedUntil = now + this.claimTtlMs
+    const wonRecords = await this.lockRecords(availableRecords, messagesToTake, claimedUntil)
 
     let messageRecordsToReturn: MessageRecord[]
-    if (deleteMessages) {
-      messageRecordsToReturn = await this.keepExisting(wonRecords, (messageRecord) =>
-        messageRepository.deleteById(agentContext, messageRecord.id)
-      )
-    } else {
-      const claimedUntil = now + this.claimTtlMs
-      messageRecordsToReturn = await this.keepExisting(wonRecords, (messageRecord) => {
-        messageRecord.claimedUntil = claimedUntil
-        return messageRepository.update(agentContext, messageRecord)
-      })
+    try {
+      if (deleteMessages) {
+        messageRecordsToReturn = await this.keepExisting(wonRecords, (messageRecord) =>
+          messageRepository.deleteById(agentContext, messageRecord.id)
+        )
+      } else {
+        messageRecordsToReturn = await this.keepExisting(wonRecords, (messageRecord) => {
+          messageRecord.claimedUntil = claimedUntil
+          return messageRepository.update(agentContext, messageRecord)
+        })
+      }
+    } catch (error) {
+      // Release what this take won, so a failed take does not hide those messages until the lease lapses.
+      await this.releaseClaims(agentContext, wonRecords, deleteMessages ? undefined : claimedUntil)
+      throw error
     }
 
     const queuedMessages = messageRecordsToReturn.map((messageRecord) => ({
@@ -112,7 +119,7 @@ export class StorageServiceMessageQueue implements DidCommQueueTransportReposito
   }
 
   /** Takes up to count records, in queue order, that the claim lock grants to this instance. */
-  private async lockRecords(records: MessageRecord[], count: number): Promise<MessageRecord[]> {
+  private async lockRecords(records: MessageRecord[], count: number, claimedUntil: number): Promise<MessageRecord[]> {
     if (!this.claimLock) return records.slice(0, count)
 
     const won: MessageRecord[] = []
@@ -121,11 +128,34 @@ export class StorageServiceMessageQueue implements DidCommQueueTransportReposito
       start += batch.length
       const results = await this.claimLock.tryClaim(
         batch.map((record) => record.id),
-        this.claimTtlMs
+        claimedUntil
       )
       won.push(...batch.filter((_, index) => results[index]))
     }
     return won
+  }
+
+  /** Best effort: clears record claims this take wrote (when claimedUntil is given) and its lock keys. */
+  private async releaseClaims(agentContext: AgentContext, records: MessageRecord[], claimedUntil?: number) {
+    const messageRepository = agentContext.resolve(MessageRepository)
+    if (claimedUntil !== undefined) {
+      await Promise.allSettled(
+        records
+          .filter((record) => record.claimedUntil === claimedUntil)
+          .map((record) => {
+            record.claimedUntil = undefined
+            return messageRepository.update(agentContext, record)
+          })
+      )
+    }
+
+    try {
+      await this.claimLock?.release(records.map((record) => record.id))
+    } catch (error) {
+      agentContext.config.logger.warn('Unable to release message claim locks; they lapse after the claim TTL', {
+        error,
+      })
+    }
   }
 
   /** Applies write to each record, dropping records acknowledged (deleted) since they were read. */

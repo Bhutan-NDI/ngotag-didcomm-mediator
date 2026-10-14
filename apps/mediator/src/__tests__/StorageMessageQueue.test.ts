@@ -57,24 +57,28 @@ class FakeMessageRepository {
 
 // In-memory stand-in for a lock every instance can see (e.g. RedisMessageClaimLock).
 class FakeClaimLock implements MessageClaimLock {
-  private held = new Map<string, number>()
+  public held = new Map<string, number>()
 
-  public async tryClaim(messageIds: string[], ttlMs: number) {
+  public async tryClaim(messageIds: string[], claimedUntil: number) {
     await new Promise((resolve) => setTimeout(resolve, 1))
     const now = Date.now()
     return messageIds.map((id) => {
       const heldUntil = this.held.get(id)
       if (heldUntil !== undefined && heldUntil > now) return false
-      this.held.set(id, now + ttlMs)
+      this.held.set(id, claimedUntil)
       return true
     })
+  }
+
+  public async release(messageIds: string[]) {
+    for (const id of messageIds) this.held.delete(id)
   }
 }
 
 function createAgentContext(repository: FakeMessageRepository) {
   return {
     contextCorrelationId: 'default',
-    config: { logger: { debug: () => {} } },
+    config: { logger: { debug: () => {}, warn: () => {} } },
     resolve: (token: unknown) => {
       if (token === MessageRepository) return repository
       throw new Error(`Unexpected resolve of ${String(token)}`)
@@ -230,7 +234,7 @@ describe('StorageServiceMessageQueue', () => {
   it('fills a limited take past messages another instance holds in the lock', async () => {
     seed(repository, 3)
     const claimLock = new FakeClaimLock()
-    await claimLock.tryClaim(['message-0'], 30_000)
+    await claimLock.tryClaim(['message-0'], Date.now() + 30_000)
     const queue = new StorageServiceMessageQueue({ claimLock })
 
     const taken = await queue.takeFromQueue(agentContext, { connectionId, limit: 2 })
@@ -241,13 +245,42 @@ describe('StorageServiceMessageQueue', () => {
   it('pickup v1 (deleteMessages) does not delete messages another instance holds in the lock', async () => {
     seed(repository, 2)
     const claimLock = new FakeClaimLock()
-    await claimLock.tryClaim(['message-0'], 30_000)
+    await claimLock.tryClaim(['message-0'], Date.now() + 30_000)
     const queue = new StorageServiceMessageQueue({ claimLock })
 
     const taken = await queue.takeFromQueue(agentContext, { connectionId, deleteMessages: true })
 
     expect(taken.map((m) => m.id)).toEqual(['message-1'])
     expect([...repository.records.keys()]).toEqual(['message-0'])
+  })
+
+  it('locks each message until the same instant as its record claim', async () => {
+    seed(repository, 1)
+    const claimLock = new FakeClaimLock()
+    const queue = new StorageServiceMessageQueue({ claimLock })
+
+    await queue.takeFromQueue(agentContext, { connectionId })
+
+    expect(claimLock.held.get('message-0')).toBe(repository.records.get('message-0')?.claimedUntil)
+  })
+
+  it('releases the lock and record claims it won when a take fails', async () => {
+    seed(repository, 2)
+    const claimLock = new FakeClaimLock()
+    const queue = new StorageServiceMessageQueue({ claimLock })
+    const update = repository.update.bind(repository)
+    vi.spyOn(repository, 'update').mockImplementation(async (context, record) => {
+      if (record.id === 'message-1' && record.claimedUntil !== undefined) throw new Error('storage write failed')
+      return update(context, record)
+    })
+
+    await expect(queue.takeFromQueue(agentContext, { connectionId })).rejects.toThrow('storage write failed')
+
+    expect(claimLock.held.size).toBe(0)
+    expect(repository.records.get('message-0')?.claimedUntil).toBeUndefined()
+    vi.restoreAllMocks()
+    const retried = await new StorageServiceMessageQueue({ claimLock }).takeFromQueue(agentContext, { connectionId })
+    expect(retried.map((m) => m.id)).toEqual(['message-0', 'message-1'])
   })
 
   it('rejects a claim TTL that is not a positive integer', () => {

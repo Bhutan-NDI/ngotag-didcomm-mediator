@@ -1,6 +1,5 @@
 import { LogLevel } from '@credo-ts/core'
 import { DidCommMessageForwardingStrategy } from '@credo-ts/didcomm'
-import { DEFAULT_MESSAGE_CLAIM_TTL_MS } from '@credo-ts/didcomm-transport-queue-dynamodb'
 import { z } from 'zod/v4'
 import { $ZodError } from 'zod/v4/core'
 import { loadConfigSync } from 'zod-config'
@@ -8,6 +7,7 @@ import { envAdapter } from 'zod-config/env-adapter'
 import { jsonAdapter } from 'zod-config/json-adapter'
 import { Logger } from './logger/index.js'
 import { resolveCredoMessageForwardingStrategy } from './message-delivery/resolveCredoMessageForwardingStrategy.js'
+import { DEFAULT_MESSAGE_CLAIM_TTL_MS } from './storage/claim.js'
 
 const claimTtlError = `Message pickup claim TTL must be a positive integer number of milliseconds. Defaults to ${DEFAULT_MESSAGE_CLAIM_TTL_MS}. Can also be set using 'MESSAGE_PICKUP__CLAIM_TTL_MS' environment variable`
 

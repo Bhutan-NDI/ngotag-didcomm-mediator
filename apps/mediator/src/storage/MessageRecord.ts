@@ -1,7 +1,7 @@
 import { BaseRecord, utils } from '@credo-ts/core'
 import type { DidCommEncryptedMessage } from '@credo-ts/didcomm'
-import { isClaimed } from '@credo-ts/didcomm-transport-queue-dynamodb'
 import type { TelemetryCarrier } from '../telemetry/api.js'
+import { isClaimed } from './claim.js'
 
 export type DefaultMessageRecordTags = {
   connectionId: string

@@ -281,13 +281,23 @@ suite('dynamodb recipient index', () => {
         )
       const recipientQueryInput = recipientQuery instanceof QueryCommand ? recipientQuery.input : undefined
       expect(recipientQueryInput?.FilterExpression).toBe(unclaimedFilter)
-      const metadataRead = send.mock.calls
+      // Index entries are small, so the claim-filtered index query reads full pages.
+      expect(recipientQueryInput?.Limit).toBeUndefined()
+      const metadataReads = send.mock.calls
         .map(([command]) => command as unknown)
-        .find((command) => command instanceof GetItemCommand)
+        .filter((command): command is GetItemCommand => command instanceof GetItemCommand)
       const canonicalRead = send.mock.calls
         .map(([command]) => command as unknown)
         .find((command) => command instanceof BatchGetItemCommand)
-      expect(metadataRead instanceof GetItemCommand ? metadataRead.input.ConsistentRead : undefined).toBeUndefined()
+      // The take reads the metadata once, strongly consistent, since it decides whether claims reach the index.
+      expect(metadataReads.map((command) => command.input.ConsistentRead)).toEqual([true])
+      const claim = send.mock.calls
+        .map(([command]) => command as unknown)
+        .find((command): command is TransactWriteItemsCommand => command instanceof TransactWriteItemsCommand)
+      expect(claim?.input.TransactItems?.map((item) => item.Update?.TableName)).toEqual([
+        'queued_messages',
+        'queued_messages_recipient_index',
+      ])
       expect(
         canonicalRead instanceof BatchGetItemCommand
           ? canonicalRead.input.RequestItems?.queued_messages?.ConsistentRead
@@ -298,7 +308,7 @@ suite('dynamodb recipient index', () => {
     }
   })
 
-  test('falls back to the canonical table when recipient metadata cannot be read while fetching', async () => {
+  test('fails a take closed when recipient metadata cannot be read', async () => {
     const messageId = '1234567890123001'
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
@@ -329,17 +339,15 @@ suite('dynamodb recipient index', () => {
 
     try {
       const client = await DynamoDbClientRepository.initialize(clientOptions)
-      await expect(client.getMessages({ connectionId, recipientDid, limit: 1 })).resolves.toEqual([
-        expect.objectContaining({ id: messageId, recipientDids: [recipientDid] }),
-      ])
+      // Without the metadata a claim could miss the recipient index, so the take fails instead of guessing.
+      await expect(client.getMessages({ connectionId, recipientDid, limit: 1 })).rejects.toThrow(
+        'recipient index unavailable'
+      )
 
-      const queries = send.mock.calls
-        .map(([command]) => command as unknown)
-        .filter((command): command is QueryCommand => command instanceof QueryCommand)
-      expect(queries).toHaveLength(1)
-      expect(queries[0].input.TableName).toBe('queued_messages')
-      expect(queries[0].input.FilterExpression).toBe(legacyRecipientFilter)
-      expect(send.mock.calls.some(([command]) => command instanceof BatchGetItemCommand)).toBe(false)
+      const writes = send.mock.calls.filter(
+        ([command]) => command instanceof UpdateItemCommand || command instanceof TransactWriteItemsCommand
+      )
+      expect(writes).toHaveLength(0)
     } finally {
       send.mockRestore()
     }
@@ -807,6 +815,28 @@ suite('dynamodb claims', () => {
     })
 
   const messageIdOf = (command: UpdateItemCommand) => command.input.Key?.messageId?.N
+
+  test('reads large pages past claimed messages instead of limit-sized ones', async () => {
+    const send = mockQueue(legacyItems(10), async () => ({}))
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      await client.getMessages({ connectionId, limit: 10 })
+      await client.getMessageCount(connectionId, undefined, 10)
+
+      const queries = send.mock.calls
+        .map(([command]) => command as unknown)
+        .filter((command): command is QueryCommand => command instanceof QueryCommand)
+      const take = queries.find((query) => query.input.Select !== 'COUNT')
+      const count = queries.find((query) => query.input.Select === 'COUNT')
+      expect(take?.input.FilterExpression).toBe(unclaimedFilter)
+      expect(take?.input.Limit).toBe(100)
+      expect(count?.input.FilterExpression).toBe(unclaimedFilter)
+      expect(count?.input.Limit).toBeUndefined()
+    } finally {
+      send.mockRestore()
+    }
+  })
 
   test('caps concurrent claim writes', async () => {
     let inFlight = 0

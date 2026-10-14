@@ -58,6 +58,8 @@ type RecipientIndexEntry = { messageId: string }
 const UNCLAIMED_FILTER = '(attribute_not_exists(claimedUntil) OR claimedUntil <= :now)'
 // Claim writes in flight per take, so a large take cannot exhaust the table's write capacity at once.
 const CLAIM_CONCURRENCY = 10
+// Minimum page size for take queries on the canonical table.
+const TAKE_PAGE_SIZE = 100
 
 const RECIPIENT_INDEX_METADATA_KEY = '__recipient_index_metadata__'
 const RECIPIENT_INDEX_PREFIX = 'r#'
@@ -363,9 +365,7 @@ export class DynamoDbClientRepository {
     cutoverMessageId?: number,
     maximumCount?: number
   ): Promise<number> {
-    return this.countQuery(this.legacyRecipientQuery(connectionId, recipientDid, now, cutoverMessageId), maximumCount, {
-      sparse: true,
-    })
+    return this.countQuery(this.legacyRecipientQuery(connectionId, recipientDid, now, cutoverMessageId), maximumCount)
   }
 
   private legacyRecipientQuery(
@@ -390,11 +390,7 @@ export class DynamoDbClientRepository {
     }
   }
 
-  private async countQuery(
-    params: QueryCommandInput,
-    maximumCount?: number,
-    { sparse = false }: { sparse?: boolean } = {}
-  ): Promise<number> {
+  private async countQuery(params: QueryCommandInput, maximumCount?: number): Promise<number> {
     let count = 0
     let lastEvaluatedKey: QueryCommandInput['ExclusiveStartKey']
     do {
@@ -403,9 +399,8 @@ export class DynamoDbClientRepository {
         new QueryCommand({
           ...params,
           Select: 'COUNT',
-          // DynamoDB applies Limit before FilterExpression, so a sparse filter (the legacy recipient match) keeps
-          // full pages instead of many tiny ones. The claim filter matches most items, so it keeps the limit.
-          Limit: maximumCount === undefined || sparse ? undefined : maximumCount - count,
+          // No Limit: DynamoDB applies it before the filter, so claimed or non-matching items would shrink each
+          // page. COUNT returns no items, so full pages are cheap; the loop stops once maximumCount is reached.
           ExclusiveStartKey: lastEvaluatedKey,
         })
       )
@@ -459,7 +454,8 @@ export class DynamoDbClientRepository {
     recipientDid?: string
   }): Promise<QueuedMessage[]> {
     const { connectionId, recipientDid, limit } = options
-    const metadata = await this.getRecipientIndexMetadataForRead(connectionId)
+    // Strongly consistent and fail-closed: whether a claim is mirrored onto the recipient index depends on it.
+    const metadata = await this.getRecipientIndexMetadata(connectionId, true)
     const claimed: Array<{ message: QueuedMessage; claimedUntil: number }> = []
     // Guards against re-attempting a message, so a lost race cannot loop.
     const attempted = new Set<string>()
@@ -467,8 +463,8 @@ export class DynamoDbClientRepository {
     while (limit === undefined || claimed.length < limit) {
       const now = Date.now()
       const wanted = limit === undefined ? undefined : limit - claimed.length
-      const found = await this.findUnclaimedMessages(connectionId, recipientDid, now, wanted)
-      const candidates = found.filter((message) => !attempted.has(message.id))
+      const found = await this.findUnclaimedMessages(connectionId, recipientDid, metadata, now, wanted)
+      const candidates = found.filter((message) => !attempted.has(message.id) && !isClaimed(message.claimedUntil, now))
       if (candidates.length === 0) break
 
       const claimedUntil = now + this.claimTtlMs
@@ -617,14 +613,13 @@ export class DynamoDbClientRepository {
   private async findUnclaimedMessages(
     connectionId: string,
     recipientDid: string | undefined,
+    metadata: RecipientIndexMetadata | undefined,
     now: number,
     limit?: number
   ): Promise<QueuedMessage[]> {
-    const messages =
-      recipientDid === undefined
-        ? await this.getMessagesByConnection(connectionId, now, limit)
-        : await this.getRecipientMessages(connectionId, recipientDid, now, limit)
-    return messages.filter((message) => !isClaimed(message.claimedUntil, now))
+    return recipientDid === undefined
+      ? await this.getMessagesByConnection(connectionId, now, limit)
+      : await this.getRecipientMessages(connectionId, recipientDid, metadata, now, limit)
   }
 
   private async getMessagesByConnection(connectionId: string, now: number, limit?: number): Promise<QueuedMessage[]> {
@@ -635,7 +630,9 @@ export class DynamoDbClientRepository {
         FilterExpression: UNCLAIMED_FILTER,
         ExpressionAttributeValues: { ':connectionId': { S: connectionId }, ':now': { N: String(now) } },
         ConsistentRead: true,
-        Limit: limit,
+        // Limit applies before the claim filter, so a page stays large enough to get past claimed messages
+        // quickly, while still bounding how many payloads one page transfers.
+        Limit: limit === undefined ? undefined : Math.max(limit, TAKE_PAGE_SIZE),
       },
       limit
     )
@@ -644,10 +641,10 @@ export class DynamoDbClientRepository {
   private async getRecipientMessages(
     connectionId: string,
     recipientDid: string,
+    metadata: RecipientIndexMetadata | undefined,
     now: number,
     limit?: number
   ): Promise<QueuedMessage[]> {
-    const metadata = await this.getRecipientIndexMetadataForRead(connectionId)
     if (!metadata) return await this.getLegacyRecipientMessages(connectionId, recipientDid, now, undefined, limit)
 
     // Old messages sort before the post-cutover indexed entries, so read them
@@ -732,7 +729,7 @@ export class DynamoDbClientRepository {
           },
           ProjectionExpression: 'messageId',
           ConsistentRead: true,
-          Limit: limit === undefined ? undefined : limit - entries.length,
+          // No Limit: it applies before the claim filter, and index entries are small, so full pages are cheap.
           ExclusiveStartKey: lastEvaluatedKey,
         })
       )
@@ -742,7 +739,7 @@ export class DynamoDbClientRepository {
         this.assertPaginationAdvanced(previousLastEvaluatedKey, lastEvaluatedKey, this.recipientIndexTableName)
       }
     } while (lastEvaluatedKey && (limit === undefined || entries.length < limit))
-    return entries
+    return limit === undefined ? entries : entries.slice(0, limit)
   }
 
   private async queryMessages(params: QueryCommandInput, limit?: number): Promise<QueuedMessage[]> {
