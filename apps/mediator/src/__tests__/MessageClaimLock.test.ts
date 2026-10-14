@@ -1,5 +1,5 @@
 import type Redis from 'ioredis'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RedisMessageClaimLock } from '../storage/MessageClaimLock.js'
 
 function createRedis(replies: Array<[Error | null, unknown]>) {
@@ -19,19 +19,34 @@ function createRedis(replies: Array<[Error | null, unknown]>) {
 }
 
 describe('RedisMessageClaimLock', () => {
-  it('claims each id with SET NX, expiring at the claim deadline', async () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('claims each id with SET NX, expiring after the time left until the claim deadline', async () => {
     const { redis, commands } = createRedis([
       [null, 'OK'],
       [null, null],
     ])
+    vi.spyOn(Date, 'now').mockReturnValue(1_000)
 
-    const won = await new RedisMessageClaimLock(redis).tryClaim(['a', 'b'], 1_800_000_000_000)
+    // Relative PX from the mediator's clock, so skew against the Redis server's clock does not matter.
+    const won = await new RedisMessageClaimLock(redis).tryClaim(['a', 'b'], 31_000)
 
     expect(won).toEqual([true, false])
     expect(commands).toEqual([
-      ['set', 'didcomm:pickup-claim:a', expect.any(String), 'PXAT', 1_800_000_000_000, 'NX'],
-      ['set', 'didcomm:pickup-claim:b', expect.any(String), 'PXAT', 1_800_000_000_000, 'NX'],
+      ['set', 'didcomm:pickup-claim:a', expect.any(String), 'PX', 30_000, 'NX'],
+      ['set', 'didcomm:pickup-claim:b', expect.any(String), 'PX', 30_000, 'NX'],
     ])
+  })
+
+  it('never sends a non-positive expiry', async () => {
+    const { redis, commands } = createRedis([[null, 'OK']])
+    vi.spyOn(Date, 'now').mockReturnValue(50_000)
+
+    await new RedisMessageClaimLock(redis).tryClaim(['a'], 31_000)
+
+    expect(commands[0][4]).toBe(1)
   })
 
   it('releases only keys that still hold its own token', async () => {

@@ -170,13 +170,13 @@ suite('dynamodb recipient index', () => {
       expect(queries).toHaveLength(1)
       expect(queries[0].input.TableName).toBe('queued_messages')
       expect(queries[0].input.FilterExpression).toBe(legacyRecipientFilter)
-      expect(queries[0].input.Limit).toBeUndefined()
+      expect(queries[0].input.Limit).toBe(100)
     } finally {
       send.mockRestore()
     }
   })
 
-  test('does not apply a pre-filter limit to a legacy recipient count', async () => {
+  test('does not shrink a legacy recipient count to limit-sized pages', async () => {
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
       if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
@@ -194,7 +194,8 @@ suite('dynamodb recipient index', () => {
         .find((command) => command instanceof QueryCommand)
       const legacyQueryInput = legacyQuery instanceof QueryCommand ? legacyQuery.input : undefined
       expect(legacyQueryInput?.FilterExpression).toBe(legacyRecipientFilter)
-      expect(legacyQueryInput?.Limit).toBeUndefined()
+      // Limit applies before the filter: a page of maximumCount (10) would be mostly empty for a sparse match.
+      expect(legacyQueryInput?.Limit).toBe(100)
     } finally {
       send.mockRestore()
     }
@@ -281,16 +282,16 @@ suite('dynamodb recipient index', () => {
         )
       const recipientQueryInput = recipientQuery instanceof QueryCommand ? recipientQuery.input : undefined
       expect(recipientQueryInput?.FilterExpression).toBe(unclaimedFilter)
-      // Index entries are small, so the claim-filtered index query reads full pages.
-      expect(recipientQueryInput?.Limit).toBeUndefined()
+      // Limit applies before the claim filter, so the index query reads bounded pages, not limit-sized ones.
+      expect(recipientQueryInput?.Limit).toBe(100)
       const metadataReads = send.mock.calls
         .map(([command]) => command as unknown)
         .filter((command): command is GetItemCommand => command instanceof GetItemCommand)
       const canonicalRead = send.mock.calls
         .map(([command]) => command as unknown)
         .find((command) => command instanceof BatchGetItemCommand)
-      // The take reads the metadata once, strongly consistent, since it decides whether claims reach the index.
-      expect(metadataReads.map((command) => command.input.ConsistentRead)).toEqual([true])
+      // The take reads the metadata once and passes it down (an eventually consistent read with a fallback).
+      expect(metadataReads).toHaveLength(1)
       const claim = send.mock.calls
         .map(([command]) => command as unknown)
         .find((command): command is TransactWriteItemsCommand => command instanceof TransactWriteItemsCommand)
@@ -308,7 +309,7 @@ suite('dynamodb recipient index', () => {
     }
   })
 
-  test('fails a take closed when recipient metadata cannot be read', async () => {
+  test('falls back to the canonical table when recipient metadata cannot be read while taking', async () => {
     const messageId = '1234567890123001'
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
@@ -339,15 +340,21 @@ suite('dynamodb recipient index', () => {
 
     try {
       const client = await DynamoDbClientRepository.initialize(clientOptions)
-      // Without the metadata a claim could miss the recipient index, so the take fails instead of guessing.
-      await expect(client.getMessages({ connectionId, recipientDid, limit: 1 })).rejects.toThrow(
-        'recipient index unavailable'
-      )
+      // An unavailable recipient index must not stop pickups: the take reads and claims on the canonical table.
+      await expect(client.getMessages({ connectionId, recipientDid, limit: 1 })).resolves.toEqual([
+        expect.objectContaining({ id: messageId, recipientDids: [recipientDid] }),
+      ])
 
-      const writes = send.mock.calls.filter(
-        ([command]) => command instanceof UpdateItemCommand || command instanceof TransactWriteItemsCommand
-      )
-      expect(writes).toHaveLength(0)
+      const queries = send.mock.calls
+        .map(([command]) => command as unknown)
+        .filter((command): command is QueryCommand => command instanceof QueryCommand)
+      expect(queries.map((query) => query.input.TableName)).toEqual(['queued_messages'])
+      expect(queries[0].input.FilterExpression).toBe(legacyRecipientFilter)
+      expect(send.mock.calls.some(([command]) => command instanceof BatchGetItemCommand)).toBe(false)
+      // The claim is a canonical-only UpdateItem; the canonical condition still arbitrates between takes.
+      const claims = send.mock.calls.map(([command]) => command as unknown)
+      expect(claims.filter((command) => command instanceof UpdateItemCommand)).toHaveLength(1)
+      expect(claims.some((command) => command instanceof TransactWriteItemsCommand)).toBe(false)
     } finally {
       send.mockRestore()
     }
@@ -832,7 +839,47 @@ suite('dynamodb claims', () => {
       expect(take?.input.FilterExpression).toBe(unclaimedFilter)
       expect(take?.input.Limit).toBe(100)
       expect(count?.input.FilterExpression).toBe(unclaimedFilter)
-      expect(count?.input.Limit).toBeUndefined()
+      expect(count?.input.Limit).toBe(100)
+    } finally {
+      send.mockRestore()
+    }
+  })
+
+  test('reads past a message the index shows free but the canonical record shows claimed', async () => {
+    // m1's claim reached only the canonical table, so the index still offers it ahead of the free m2.
+    const indexedItem = (messageId: string, claimedUntil?: number) => ({
+      connectionId: { S: connectionId },
+      messageId: { N: messageId },
+      recipientDids: { L: [{ S: recipientDid }] },
+      receivedAt: { N: '0' },
+      ...(claimedUntil === undefined ? {} : { claimedUntil: { N: String(claimedUntil) } }),
+    })
+    const canonical = new Map([
+      ['11', indexedItem('11', Date.now() + 60_000)],
+      ['12', indexedItem('12')],
+    ])
+    const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof GetItemCommand) {
+        return { Item: { connectionId: { S: connectionId }, cutoverMessageId: { N: '0' } } } as never
+      }
+      if (command instanceof QueryCommand && command.input.TableName === 'queued_messages_recipient_index') {
+        return { Items: [{ messageId: { N: '11' } }, { messageId: { N: '12' } }] } as never
+      }
+      if (command instanceof QueryCommand) return { Items: [] } as never
+      if (command instanceof BatchGetItemCommand) {
+        const keys = command.input.RequestItems?.queued_messages?.Keys ?? []
+        return { Responses: { queued_messages: keys.map((key) => canonical.get(key.messageId?.N ?? '')) } } as never
+      }
+      return {} as never
+    })
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      expect((await client.getMessages({ connectionId, recipientDid, limit: 1 })).map((message) => message.id)).toEqual(
+        ['12']
+      )
     } finally {
       send.mockRestore()
     }

@@ -23,9 +23,11 @@ export class RedisMessageClaimLock implements MessageClaimLock {
   public async tryClaim(messageIds: string[], claimedUntil: number): Promise<boolean[]> {
     if (messageIds.length === 0) return []
 
+    // Relative PX from this instance's clock, so the key lapses with the record's claimedUntil whatever Redis's clock
+    // says (PXAT would apply our deadline on the server's clock).
+    const ttlMs = Math.max(claimedUntil - Date.now(), 1)
     const pipeline = this.redis.pipeline()
-    // PXAT expires the key at the same instant as the record's claimedUntil.
-    for (const messageId of messageIds) pipeline.set(this.key(messageId), this.owner, 'PXAT', claimedUntil, 'NX')
+    for (const messageId of messageIds) pipeline.set(this.key(messageId), this.owner, 'PX', ttlMs, 'NX')
     const replies = (await pipeline.exec()) ?? []
 
     return replies.map(([error, reply]) => {

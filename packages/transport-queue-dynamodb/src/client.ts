@@ -58,8 +58,11 @@ type RecipientIndexEntry = { messageId: string }
 const UNCLAIMED_FILTER = '(attribute_not_exists(claimedUntil) OR claimedUntil <= :now)'
 // Claim writes in flight per take, so a large take cannot exhaust the table's write capacity at once.
 const CLAIM_CONCURRENCY = 10
-// Minimum page size for take queries on the canonical table.
-const TAKE_PAGE_SIZE = 100
+// Minimum page size for claim-filtered queries. Limit applies before the filter, so a limit-sized page shrinks to
+// nothing behind claimed messages, while an unbounded one evaluates (and is charged for) up to 1 MB.
+const QUERY_PAGE_SIZE = 100
+// Upper bound on read rounds per take, in case reads keep returning messages it cannot claim.
+const MAX_TAKE_ROUNDS = 10
 
 const RECIPIENT_INDEX_METADATA_KEY = '__recipient_index_metadata__'
 const RECIPIENT_INDEX_PREFIX = 'r#'
@@ -399,8 +402,7 @@ export class DynamoDbClientRepository {
         new QueryCommand({
           ...params,
           Select: 'COUNT',
-          // No Limit: DynamoDB applies it before the filter, so claimed or non-matching items would shrink each
-          // page. COUNT returns no items, so full pages are cheap; the loop stops once maximumCount is reached.
+          Limit: maximumCount === undefined ? undefined : Math.max(maximumCount - count, QUERY_PAGE_SIZE),
           ExclusiveStartKey: lastEvaluatedKey,
         })
       )
@@ -454,34 +456,42 @@ export class DynamoDbClientRepository {
     recipientDid?: string
   }): Promise<QueuedMessage[]> {
     const { connectionId, recipientDid, limit } = options
-    // Strongly consistent and fail-closed: whether a claim is mirrored onto the recipient index depends on it.
-    const metadata = await this.getRecipientIndexMetadata(connectionId, true)
+    // Without metadata (unreadable or not yet written) claims stay on the canonical table, which still arbitrates;
+    // only the recipient count may read high until those leases lapse.
+    const metadata = await this.getRecipientIndexMetadataForRead(connectionId)
     const claimed: Array<{ message: QueuedMessage; claimedUntil: number }> = []
-    // Guards against re-attempting a message, so a lost race cannot loop.
+    // Messages the server filter passes but whose canonical record is claimed (a claim that missed the index). They
+    // keep coming back, so later reads ask for that many more and they cannot crowd out free messages behind them.
+    const heldElsewhere = new Set<string>()
+    // Messages this take already tried to claim. Won or lost, they are claimed now, so reads do not return them.
     const attempted = new Set<string>()
 
-    while (limit === undefined || claimed.length < limit) {
+    for (let round = 0; round < MAX_TAKE_ROUNDS && (limit === undefined || claimed.length < limit); round++) {
       const now = Date.now()
-      const wanted = limit === undefined ? undefined : limit - claimed.length
+      const needed = limit === undefined ? undefined : limit - claimed.length
+      const wanted = needed === undefined ? undefined : needed + heldElsewhere.size
       const found = await this.findUnclaimedMessages(connectionId, recipientDid, metadata, now, wanted)
-      const candidates = found.filter((message) => !attempted.has(message.id) && !isClaimed(message.claimedUntil, now))
-      if (candidates.length === 0) break
+      for (const message of found) if (isClaimed(message.claimedUntil, now)) heldElsewhere.add(message.id)
+      const available = found.filter((message) => !heldElsewhere.has(message.id) && !attempted.has(message.id))
+      const candidates = needed === undefined ? available : available.slice(0, needed)
 
-      const claimedUntil = now + this.claimTtlMs
-      for (const message of candidates) attempted.add(message.id)
-      const results = await this.settleWithConcurrency(candidates, (message) =>
-        this.claimMessage(connectionId, message, metadata, now, claimedUntil)
-      )
-      candidates.forEach((message, index) => {
-        const result = results[index]
-        if (result.status === 'fulfilled' && result.value) claimed.push({ message, claimedUntil })
-      })
+      if (candidates.length > 0) {
+        const claimedUntil = now + this.claimTtlMs
+        for (const message of candidates) attempted.add(message.id)
+        const results = await this.settleWithConcurrency(candidates, (message) =>
+          this.claimMessage(connectionId, message, metadata, now, claimedUntil)
+        )
+        candidates.forEach((message, index) => {
+          const result = results[index]
+          if (result.status === 'fulfilled' && result.value) claimed.push({ message, claimedUntil })
+        })
 
-      const failure = results.find((result) => result.status === 'rejected')
-      if (failure) {
-        // Release what this take won, so a failed take does not hide those messages for a whole lease.
-        await this.releaseClaims(connectionId, claimed, metadata)
-        throw failure.reason
+        const failure = results.find((result) => result.status === 'rejected')
+        if (failure) {
+          // Release what this take won, so a failed take does not hide those messages for a whole lease.
+          await this.releaseClaims(connectionId, claimed, metadata)
+          throw failure.reason
+        }
       }
 
       // Fewer than requested means the read reached the end of the queue.
@@ -630,9 +640,7 @@ export class DynamoDbClientRepository {
         FilterExpression: UNCLAIMED_FILTER,
         ExpressionAttributeValues: { ':connectionId': { S: connectionId }, ':now': { N: String(now) } },
         ConsistentRead: true,
-        // Limit applies before the claim filter, so a page stays large enough to get past claimed messages
-        // quickly, while still bounding how many payloads one page transfers.
-        Limit: limit === undefined ? undefined : Math.max(limit, TAKE_PAGE_SIZE),
+        Limit: limit === undefined ? undefined : Math.max(limit, QUERY_PAGE_SIZE),
       },
       limit
     )
@@ -729,7 +737,7 @@ export class DynamoDbClientRepository {
           },
           ProjectionExpression: 'messageId',
           ConsistentRead: true,
-          // No Limit: it applies before the claim filter, and index entries are small, so full pages are cheap.
+          Limit: limit === undefined ? undefined : Math.max(limit - entries.length, QUERY_PAGE_SIZE),
           ExclusiveStartKey: lastEvaluatedKey,
         })
       )
