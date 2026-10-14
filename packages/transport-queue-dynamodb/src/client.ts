@@ -32,6 +32,7 @@ export type AddQueuedMessageOptions = {
   receivedAt?: Date
   recipientDids: string[]
   encryptedMessage: DidCommEncryptedMessage
+  telemetry?: Record<string, string>
 }
 
 export type RemoveQueuedMessageOptions = {
@@ -113,6 +114,10 @@ export class DynamoDbClientRepository {
     })
 
     return dcr
+  }
+
+  public shutdown(): void {
+    this.dynamodbClient.destroy()
   }
 
   private async ensureTable(params: CreateTableCommandInput): Promise<void> {
@@ -682,11 +687,14 @@ export class DynamoDbClientRepository {
     const messageUpdate = {
       TableName: this.tableName,
       Key: marshall({ connectionId: options.connectionId, messageId: Number(messageId) }),
-      UpdateExpression: 'set encryptedMessage = :em, recipientDids = :rd, receivedAt = :ra',
+      UpdateExpression: `set encryptedMessage = :em, recipientDids = :rd, receivedAt = :ra${
+        options.telemetry ? ', telemetry = :tc' : ''
+      }`,
       ExpressionAttributeValues: marshall({
         ':em': options.encryptedMessage,
         ':rd': options.recipientDids,
         ':ra': receivedAt.getTime(),
+        ...(options.telemetry ? { ':tc': options.telemetry } : {}),
       }),
     }
 

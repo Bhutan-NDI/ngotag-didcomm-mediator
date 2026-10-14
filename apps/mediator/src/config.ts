@@ -6,6 +6,7 @@ import { loadConfigSync } from 'zod-config'
 import { envAdapter } from 'zod-config/env-adapter'
 import { jsonAdapter } from 'zod-config/json-adapter'
 import { Logger } from './logger/index.js'
+import { resolveCredoMessageForwardingStrategy } from './message-delivery/resolveCredoMessageForwardingStrategy.js'
 
 const zFirebaseProjects = z.array(
   z.object({
@@ -364,27 +365,6 @@ const zConfig = z
       })
       .optional(),
     invitationGoalCode: z.string().optional(),
-    // Master switch for the latency debug instrumentation. When false (default)
-    // the agent wires the STOCK transports / queue repository and registers no
-    // instrumentation middleware, event subscribers, gauges or admin endpoint —
-    // behaviour is identical to upstream and no instrumentation code runs on the
-    // hot path. When true, the instrumented components are wired and the
-    // /admin/log-level endpoint controls verbosity at runtime. Env:
-    // INSTRUMENTATION_ENABLED.
-    instrumentationEnabled: z
-      .enum(['true', 'false'])
-      .transform((v) => v === 'true')
-      .or(z.boolean())
-      .optional()
-      .default(false),
-    // Bearer token guarding the debug-instrumentation /admin/log-level endpoint.
-    // If unset, the endpoint is disabled (returns 503). Set via ADMIN_TOKEN.
-    adminToken: z
-      .string({
-        error:
-          "Admin token must be a string. Guards the /admin/log-level debug endpoint. Can also be set using 'ADMIN_TOKEN' environment variable",
-      })
-      .optional(),
     // Server-side WebSocket keepalive interval (seconds). Pings idle live-mode
     // sockets so an intermediary idle timeout does not silently drop them and
     // tear down the live pickup session. Set to 0 to disable. Env:
@@ -424,6 +404,11 @@ const zConfig = z
 
 export type Config = z.infer<typeof zConfig>
 export const config = loadMediatorConfig()
+export const configuredMessageForwardingStrategy = config.messagePickup.forwardingStrategy
+export const effectiveCredoMessageForwardingStrategy = resolveCredoMessageForwardingStrategy({
+  configuredStrategy: configuredMessageForwardingStrategy,
+  multiInstanceDeliveryType: config.messagePickup.multiInstanceDelivery.type,
+})
 export const logger = new Logger(LogLevel[config.logLevel])
 
 function loadMediatorConfig(): Config {

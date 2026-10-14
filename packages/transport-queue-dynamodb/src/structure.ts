@@ -7,6 +7,7 @@ export type QueuedMessage = Required<CredoQueuedMessage> & {
   recipientDids: Array<string>
   /** Epoch milliseconds until which a pickup v2 delivery holds this message, see DynamoDbClientRepository. */
   claimedUntil?: number
+  telemetry?: Record<string, string>
 }
 
 export const attributeDefinitions: Array<AttributeDefinition> = [
