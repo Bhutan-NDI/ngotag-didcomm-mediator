@@ -2,14 +2,11 @@ import type { Socket } from 'node:net'
 import { AskarModule, AskarStoreDuplicateError } from '@credo-ts/askar'
 import { Agent } from '@credo-ts/core'
 import {
-  DidCommMediatorService,
-  DidCommMessageReceiver,
   DidCommMessageSender,
   DidCommMimeType,
   DidCommModule,
   DidCommOutOfBandRole,
   DidCommOutOfBandState,
-  DidCommTransportService,
 } from '@credo-ts/didcomm'
 import { DidCommPushNotificationsFcmModule } from '@credo-ts/didcomm-push-notifications'
 import { agentDependencies, DidCommHttpInboundTransport, DidCommWsInboundTransport } from '@credo-ts/node'
@@ -30,8 +27,7 @@ import {
   logger,
 } from './config.js'
 import { wireEventInstrumentation } from './instrumentation/eventInstrumentation.js'
-import { InstrumentedMediatorService } from './instrumentation/InstrumentedMediatorService.js'
-import { InstrumentedMessageReceiver } from './instrumentation/InstrumentedMessageReceiver.js'
+import { InstrumentationOverridesModule } from './instrumentation/InstrumentationOverridesModule.js'
 import { InstrumentedQueueTransportRepository } from './instrumentation/InstrumentedQueueTransportRepository.js'
 import { instrumentQueuedDelivery } from './instrumentation/instrumentQueuedDelivery.js'
 import {
@@ -44,7 +40,6 @@ import { StorageServiceMessageQueue } from './storage/StorageMessageQueue.js'
 import { registerWebSocketTelemetryContext } from './telemetry/api.js'
 import { closeWebSocketClients } from './transports/closeWebSocketClients.js'
 import { InstrumentedHttpOutboundTransport } from './transports/InstrumentedHttpOutboundTransport.js'
-import { InstrumentedTransportService } from './transports/InstrumentedTransportService.js'
 import { InstrumentedWsOutboundTransport } from './transports/InstrumentedWsOutboundTransport.js'
 import { startWsHeartbeat } from './transports/wsHeartbeat.js'
 
@@ -161,6 +156,7 @@ export async function createAgent() {
       app,
       socketServer,
     })),
+    instrumentationOverrides: new InstrumentationOverridesModule(),
   } as const
 
   const agent = new Agent<typeof modules & { askar: AskarModule }>({
@@ -171,12 +167,6 @@ export async function createAgent() {
     dependencies: agentDependencies,
     modules: modules as typeof modules & { askar: AskarModule },
   })
-
-  // Register before initialization so every message-processing path resolves the
-  // traced singleton, including live delivery paths that bypass outbound transports.
-  agent.dependencyManager.registerSingleton(DidCommMessageReceiver, InstrumentedMessageReceiver)
-  agent.dependencyManager.registerSingleton(DidCommTransportService, InstrumentedTransportService)
-  agent.dependencyManager.registerSingleton(DidCommMediatorService, InstrumentedMediatorService)
 
   // Added health check endpoint
   app.get('/health', async (_req, res) => {
