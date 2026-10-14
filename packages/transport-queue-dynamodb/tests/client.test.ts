@@ -1,9 +1,11 @@
+import { randomUUID } from 'node:crypto'
 import { ConsoleLogger, LogLevel } from '@credo-ts/core'
 import { DidCommEncryptedMessage } from '@credo-ts/didcomm'
 import { beforeAll, expect, suite, test } from 'vitest'
 import { DynamoDbClientRepository } from '../src/client.js'
 
-const connectionId = '4ffdd113-117b-4827-9af5-28aa73ec4bad'
+// Random per run, so rows and enqueue idempotency tokens left by earlier runs cannot leak into these tests.
+const connectionId = randomUUID()
 const recipientDids = ['did:key:123', 'did:jwk:123', 'did:peer:3abba']
 const encryptedMessage: DidCommEncryptedMessage = {
   ciphertext: 'ciphertext',
@@ -12,7 +14,8 @@ const encryptedMessage: DidCommEncryptedMessage = {
   tag: 'tag',
 }
 
-const CLAIM_TTL_MS = 100
+// Long enough that the next test still sees the previous test's claim, even on a slow run.
+const CLAIM_TTL_MS = 1000
 
 suite('dynamodb client', () => {
   let client: DynamoDbClientRepository
@@ -90,7 +93,7 @@ suite('dynamodb client', () => {
   })
 
   test('round-trips W3C trace context in the queue sidecar', async () => {
-    const telemetryConnectionId = 'telemetry-connection-id'
+    const telemetryConnectionId = randomUUID()
     const telemetry = {
       traceparent: '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
       tracestate: 'vendor=value',
@@ -111,14 +114,17 @@ suite('dynamodb client', () => {
   })
 
   test('get message and remove a message', async () => {
-    const count = await client.getMessageCount(connectionId)
+    // Its own connection: the shared one still holds the previous test's claim, which pickup v1 must respect.
+    const removeConnectionId = randomUUID()
+    await client.addMessage({ connectionId: removeConnectionId, encryptedMessage, recipientDids })
+    const count = await client.getMessageCount(removeConnectionId)
 
     await client.getMessages({
-      connectionId: connectionId,
+      connectionId: removeConnectionId,
       deleteMessages: true,
     })
 
-    const countAfterDelete = await client.getMessageCount(connectionId)
+    const countAfterDelete = await client.getMessageCount(removeConnectionId)
 
     expect(count).toBeGreaterThan(countAfterDelete)
   })
@@ -141,7 +147,7 @@ suite('dynamodb client', () => {
   })
 
   test('add and delete bunch of messages', async () => {
-    const newConnectionId = 'new-connection-id'
+    const newConnectionId = randomUUID()
     const requests: Array<Promise<string>> = []
     for (let i = 0; i < 100; i++) {
       requests.push(
@@ -169,7 +175,7 @@ suite('dynamodb client', () => {
   })
 
   test('counts messages across DynamoDB query pages', async () => {
-    const newConnectionId = 'large-connection-id'
+    const newConnectionId = randomUUID()
     const largeEncryptedMessage = {
       ...encryptedMessage,
       ciphertext: 'x'.repeat(300_000),
@@ -193,7 +199,7 @@ suite('dynamodb client', () => {
   })
 
   test('counts and takes the same recipient messages', async () => {
-    const newConnectionId = 'recipient-filter-connection-id'
+    const newConnectionId = randomUUID()
     const otherRecipientDid = 'did:key:other'
     const targetRecipientDid = 'did:key:target'
     const otherMessageIds = await Promise.all(
@@ -233,6 +239,8 @@ suite('dynamodb client', () => {
   })
 
   test('validate sorting', async () => {
+    // Its own connection, so messages left claimed by earlier tests cannot interleave.
+    const connectionId = randomUUID()
     const now = new Date()
     const oneHourInThePast = new Date()
     oneHourInThePast.setHours(oneHourInThePast.getHours() - 1)

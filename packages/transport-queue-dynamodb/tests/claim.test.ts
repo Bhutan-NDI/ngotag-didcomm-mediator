@@ -142,6 +142,40 @@ suite('dynamodb pickup v2 claim on take', () => {
     expect(await instanceA.getMessageCount(connectionId)).toBe(0)
   })
 
+  test('counts exclude claimed messages, on the connection and recipient paths', async () => {
+    const connectionId = randomUUID()
+    await queueMessages(connectionId, 3)
+
+    await instanceA.getMessages({ connectionId, limit: 2 })
+
+    expect(await instanceB.getMessageCount(connectionId)).toBe(1)
+    expect(await instanceB.getMessageCount(connectionId, recipientDid)).toBe(1)
+  })
+
+  test('a recipient-scoped claim is visible to connection-scoped takes and counts', async () => {
+    const connectionId = randomUUID()
+    const queued = await queueMessages(connectionId, 2)
+
+    expect(ids(await instanceA.getMessages({ connectionId, recipientDid, limit: 1 }))).toEqual([queued[0]])
+    expect(ids(await instanceB.getMessages({ connectionId, limit: 10 }))).toEqual([queued[1]])
+    expect(await instanceB.getMessageCount(connectionId, recipientDid)).toBe(0)
+  })
+
+  test('pickup v1 (deleteMessages) does not return or delete messages a v2 delivery holds', async () => {
+    const connectionId = randomUUID()
+    const queued = await queueMessages(connectionId, 3)
+
+    const held = await instanceA.getMessages({ connectionId, limit: 1 })
+    const deleted = await instanceB.getMessages({ connectionId, limit: 10, deleteMessages: true })
+
+    expect(ids(held)).toEqual([queued[0]])
+    expect(ids(deleted)).toEqual(queued.slice(1))
+
+    // The held message survives until its own acknowledgement.
+    await instanceA.removeMessages({ connectionId, messageIds: ids(held) })
+    expect(await instanceA.getMessageCount(connectionId)).toBe(0)
+  })
+
   test('rejects a claim TTL that is not a positive integer', async () => {
     await expect(createClient({ claimTtlMs: 0 })).rejects.toThrow(/claimTtlMs must be a positive integer/)
   })

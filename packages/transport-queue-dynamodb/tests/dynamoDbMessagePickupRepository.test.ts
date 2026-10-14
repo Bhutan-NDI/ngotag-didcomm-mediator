@@ -46,7 +46,8 @@ suite('dynamoDbMessagePickupRepository', () => {
     const count = await repository.getAvailableMessageCount(agentContext, { connectionId })
 
     expect(messages.length).toStrictEqual(1)
-    expect(messages.length).toStrictEqual(count)
+    // The taken message is claimed until acknowledged, so it is no longer available.
+    expect(count).toStrictEqual(0)
   })
 
   test('delete message', async () => {

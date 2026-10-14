@@ -14,6 +14,8 @@ import { DynamoDbClientRepository } from '../src/client.js'
 
 const connectionId = '4ffdd113-117b-4827-9af5-28aa73ec4bad'
 const recipientDid = 'did:key:123'
+const unclaimedFilter = '(attribute_not_exists(claimedUntil) OR claimedUntil <= :now)'
+const legacyRecipientFilter = `contains(recipientDids, :recipientDid) AND ${unclaimedFilter}`
 const clientOptions = {
   logger: new ConsoleLogger(LogLevel.off),
   region: 'local',
@@ -85,7 +87,7 @@ suite('dynamodb recipient index', () => {
     }
   })
 
-  test('counts recipient messages through a key condition instead of a filter', async () => {
+  test('counts recipient messages through a key condition, filtering only on claims', async () => {
     const send = vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
       if (command instanceof CreateTableCommand) return {} as never
       if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
@@ -118,7 +120,7 @@ suite('dynamodb recipient index', () => {
       expect(recipientQueryInput?.KeyConditionExpression).toBe(
         'connectionId = :connectionId AND recipientMessageId BETWEEN :recipientIndexStart AND :recipientIndexEnd'
       )
-      expect(recipientQueryInput?.FilterExpression).toBeUndefined()
+      expect(recipientQueryInput?.FilterExpression).toBe(unclaimedFilter)
       expect(recipientQueryInput?.Select).toBe('COUNT')
     } finally {
       send.mockRestore()
@@ -142,7 +144,7 @@ suite('dynamodb recipient index', () => {
         .map(([command]) => command as unknown)
         .find((command) => command instanceof QueryCommand)
       const legacyQueryInput = legacyQuery instanceof QueryCommand ? legacyQuery.input : undefined
-      expect(legacyQueryInput?.FilterExpression).toBe('contains(recipientDids, :recipientDid)')
+      expect(legacyQueryInput?.FilterExpression).toBe(legacyRecipientFilter)
     } finally {
       send.mockRestore()
     }
@@ -167,7 +169,7 @@ suite('dynamodb recipient index', () => {
         .filter((command): command is QueryCommand => command instanceof QueryCommand)
       expect(queries).toHaveLength(1)
       expect(queries[0].input.TableName).toBe('queued_messages')
-      expect(queries[0].input.FilterExpression).toBe('contains(recipientDids, :recipientDid)')
+      expect(queries[0].input.FilterExpression).toBe(legacyRecipientFilter)
       expect(queries[0].input.Limit).toBeUndefined()
     } finally {
       send.mockRestore()
@@ -191,7 +193,7 @@ suite('dynamodb recipient index', () => {
         .map(([command]) => command as unknown)
         .find((command) => command instanceof QueryCommand)
       const legacyQueryInput = legacyQuery instanceof QueryCommand ? legacyQuery.input : undefined
-      expect(legacyQueryInput?.FilterExpression).toBe('contains(recipientDids, :recipientDid)')
+      expect(legacyQueryInput?.FilterExpression).toBe(legacyRecipientFilter)
       expect(legacyQueryInput?.Limit).toBeUndefined()
     } finally {
       send.mockRestore()
@@ -278,7 +280,7 @@ suite('dynamodb recipient index', () => {
           (command) => command instanceof QueryCommand && command.input.TableName === 'queued_messages_recipient_index'
         )
       const recipientQueryInput = recipientQuery instanceof QueryCommand ? recipientQuery.input : undefined
-      expect(recipientQueryInput?.FilterExpression).toBeUndefined()
+      expect(recipientQueryInput?.FilterExpression).toBe(unclaimedFilter)
       const metadataRead = send.mock.calls
         .map(([command]) => command as unknown)
         .find((command) => command instanceof GetItemCommand)
@@ -336,7 +338,7 @@ suite('dynamodb recipient index', () => {
         .filter((command): command is QueryCommand => command instanceof QueryCommand)
       expect(queries).toHaveLength(1)
       expect(queries[0].input.TableName).toBe('queued_messages')
-      expect(queries[0].input.FilterExpression).toBe('contains(recipientDids, :recipientDid)')
+      expect(queries[0].input.FilterExpression).toBe(legacyRecipientFilter)
       expect(send.mock.calls.some(([command]) => command instanceof BatchGetItemCommand)).toBe(false)
     } finally {
       send.mockRestore()
@@ -601,7 +603,9 @@ suite('dynamodb recipient index', () => {
         } as never
       }
       if (command instanceof TransactWriteItemsCommand) {
-        const transactionSize = command.input.TransactItems?.length ?? 0
+        // Claim transactions (Updates) precede the deletes; only the delete batching is under test.
+        if (!command.input.TransactItems?.every((item) => item.Delete)) return {} as never
+        const transactionSize = command.input.TransactItems.length
         transactionSizes.push(transactionSize)
         if (transactionSize === 100) throw new Error('first transaction failed')
         return {} as never
@@ -773,6 +777,97 @@ suite('dynamodb recipient index', () => {
       expect(batchSizes).toEqual([100, 1])
       resolveFirstChunk?.({ Responses: { queued_messages: [] } })
       await expect(batchGet).resolves.toEqual([])
+    } finally {
+      send.mockRestore()
+    }
+  })
+})
+
+suite('dynamodb claims', () => {
+  // Without recipient index metadata every message is legacy, so each claim is a single UpdateItem.
+  const legacyItems = (count: number) =>
+    Array.from({ length: count }, (_, index) => ({
+      connectionId: { S: connectionId },
+      messageId: { N: String(index + 1) },
+      recipientDids: { L: [{ S: recipientDid }] },
+      receivedAt: { N: String(index) },
+    }))
+
+  const mockQueue = (
+    items: ReturnType<typeof legacyItems>,
+    onUpdate: (command: UpdateItemCommand) => Promise<unknown>
+  ) =>
+    vi.spyOn(DynamoDBClient.prototype, 'send').mockImplementation(async (command) => {
+      if (command instanceof CreateTableCommand) return {} as never
+      if (command instanceof DescribeTableCommand) return { Table: { TableStatus: 'ACTIVE' } } as never
+      if (command instanceof GetItemCommand) return {} as never
+      if (command instanceof QueryCommand) return { Items: items } as never
+      if (command instanceof UpdateItemCommand) return (await onUpdate(command)) as never
+      return {} as never
+    })
+
+  const messageIdOf = (command: UpdateItemCommand) => command.input.Key?.messageId?.N
+
+  test('caps concurrent claim writes', async () => {
+    let inFlight = 0
+    let maxInFlight = 0
+    const send = mockQueue(legacyItems(25), async () => {
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      inFlight -= 1
+      return {}
+    })
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      expect(await client.getMessages({ connectionId })).toHaveLength(25)
+      expect(maxInFlight).toBe(10)
+    } finally {
+      send.mockRestore()
+    }
+  })
+
+  test('retries a throttled claim write', async () => {
+    let attempts = 0
+    const send = mockQueue(legacyItems(1), async () => {
+      attempts += 1
+      if (attempts === 1) {
+        const error = new Error('throttled')
+        error.name = 'ThrottlingException'
+        throw error
+      }
+      return {}
+    })
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      expect(await client.getMessages({ connectionId, limit: 1 })).toHaveLength(1)
+      expect(attempts).toBe(2)
+    } finally {
+      send.mockRestore()
+    }
+  })
+
+  test('releases the claims it won when a take fails', async () => {
+    const updates: UpdateItemCommand[] = []
+    const send = mockQueue(legacyItems(3), async (command) => {
+      updates.push(command)
+      if (command.input.UpdateExpression?.startsWith('SET') && messageIdOf(command) === '2') {
+        throw new Error('claim write failed')
+      }
+      return {}
+    })
+
+    try {
+      const client = await DynamoDbClientRepository.initialize(clientOptions)
+      await expect(client.getMessages({ connectionId, limit: 3 })).rejects.toThrow('claim write failed')
+
+      const releases = updates.filter((command) => command.input.UpdateExpression === 'REMOVE claimedUntil')
+      expect(releases.map(messageIdOf)).toEqual(['1', '3'])
+      expect(releases.every((command) => command.input.ConditionExpression === 'claimedUntil = :claimedUntil')).toBe(
+        true
+      )
     } finally {
       send.mockRestore()
     }
