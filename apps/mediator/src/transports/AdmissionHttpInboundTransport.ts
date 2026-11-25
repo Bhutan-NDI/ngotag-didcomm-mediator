@@ -89,6 +89,13 @@ type Waiter = { resolve: () => void; reject: (error: Error) => void; timer: Node
  * (see {@link HttpAdmissionSession}). Everything else is as in `DidCommHttpInboundTransport`: the same route,
  * content types, body limit, reply on the connection and time limit. One listener serves every request, where
  * Credo's subscribes one filter per request.
+ *
+ * ON EVERY CREDO UPGRADE, compare this file with Credo's `DidCommHttpInboundTransport` and `DidCommMessageReceiver`
+ * again (written against 0.6.0). Refusing a message before it is acknowledged rests on three things Credo does
+ * today: the receiver calls `session.close()` right before it dispatches the message; the encrypted message
+ * keeps its object identity from the transport to the message context; and the first middleware runs before
+ * the next turn of the event loop. If one of them changes, an over-size forward is answered 200 again and
+ * nothing else breaks: `queueAdmission.e2e.test.ts` is the test that shows it.
  */
 export class AdmissionHttpInboundTransport extends DidCommHttpInboundTransport {
   private readonly listenPort: number
