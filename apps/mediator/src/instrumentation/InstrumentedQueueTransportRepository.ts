@@ -24,6 +24,9 @@ import {
 
 type QueueOperation = 'enqueue' | 'receive' | 'settle' | 'count'
 
+// version "00", a 32-character trace id, a 16-character parent id and 2-character flags (W3C Trace Context).
+const TRACEPARENT_OF_FIXED_LENGTH = `00-${'0'.repeat(32)}-${'0'.repeat(16)}-00`
+
 export class InstrumentedQueueTransportRepository implements ExtendedQueueTransportRepository {
   public constructor(
     private readonly inner: ExtendedQueueTransportRepository,
@@ -105,6 +108,18 @@ export class InstrumentedQueueTransportRepository implements ExtendedQueueTransp
       },
       { 'messaging.batch.message_count': options.limit }
     )
+  }
+
+  /**
+   * The size check of the backend, if it has one, for the item `addMessage` below would write: the same
+   * message with a telemetry carrier beside it. The carrier counted here is never smaller than the stored one:
+   * a `traceparent` has one fixed length, and a span started for the enqueue inherits this context's `tracestate`.
+   */
+  public assertMessageFits(options: Pick<AddMessageOptions, 'recipientDids' | 'payload'>): void {
+    this.inner.assertMessageFits?.({
+      ...options,
+      telemetry: { ...injectTelemetryContext(), traceparent: TRACEPARENT_OF_FIXED_LENGTH },
+    })
   }
 
   public addMessage(agentContext: AgentContext, options: AddMessageOptions): Promise<string> {

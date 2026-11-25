@@ -36,6 +36,9 @@ export const forwardDuration = meter.createHistogram('didcomm.forward.duration',
 export const queueOperationCounter = meter.createCounter('didcomm.queue.operations', {
   description: 'Pickup queue operations',
 })
+export const forwardRefusedCounter = meter.createCounter('didcomm.forward.refused', {
+  description: 'Forward messages refused before they were handled, by reason and transport',
+})
 export const queueOperationDuration = meter.createHistogram('didcomm.queue.operation.duration', {
   description: 'Pickup queue operation duration',
   unit: 's',

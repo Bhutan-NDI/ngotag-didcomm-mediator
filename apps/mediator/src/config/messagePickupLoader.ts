@@ -1,5 +1,5 @@
 import { Agent, AgentContext } from '@credo-ts/core'
-import { DidCommQueueTransportRepository } from '@credo-ts/didcomm'
+import { AddMessageOptions, DidCommQueueTransportRepository } from '@credo-ts/didcomm'
 import { DidCommTransportQueueDynamoDb } from '@credo-ts/didcomm-transport-queue-dynamodb'
 import { DidCommTransportQueuePostgres } from '@credo-ts/didcomm-transport-queue-postgres'
 import type Redis from 'ioredis'
@@ -11,6 +11,13 @@ export interface ExtendedQueueTransportRepository extends DidCommQueueTransportR
   initialize?: (agent: Agent) => Promise<void>
   getPoolStats?: () => { total: number; idle: number; waiting: number } | null
   shutdown?: (agentContext: AgentContext) => Promise<void>
+  /**
+   * For a backend with a size limit: throws when `addMessage` would refuse the message for its size, without
+   * reading or writing anything. A backend without a limit leaves it out.
+   */
+  assertMessageFits?: (
+    options: Pick<AddMessageOptions, 'recipientDids' | 'payload'> & { telemetry?: Record<string, string> }
+  ) => void
 }
 
 export async function loadMessagePickupStorage({

@@ -20,6 +20,7 @@ import { marshall, unmarshall } from '@aws-sdk/util-dynamodb'
 import { Logger } from '@credo-ts/core'
 import { DidCommEncryptedMessage } from '@credo-ts/didcomm'
 import { assertValidClaimTtl, DEFAULT_MESSAGE_CLAIM_TTL_MS, isClaimed } from './claim.js'
+import { assertQueuedMessageFits } from './itemSize.js'
 import {
   attributeDefinitions,
   keySchema,
@@ -818,6 +819,10 @@ export class DynamoDbClientRepository {
   }
 
   async addMessage(options: AddQueuedMessageOptions): Promise<string> {
+    // DynamoDB would refuse the write, after a round trip and inside a transaction. Refuse it here instead,
+    // before anything is sent, with an error the caller can tell apart from a failed write.
+    assertQueuedMessageFits(options)
+
     const metadata = await this.prepareRecipientIndex(options.connectionId)
     const randomizer = randomInt(0, 999).toString().padStart(3, '0')
     const receivedAt = options.receivedAt ?? new Date()

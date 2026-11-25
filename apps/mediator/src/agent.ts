@@ -2,6 +2,7 @@ import type { Socket } from 'node:net'
 import { AskarModule, AskarStoreDuplicateError } from '@credo-ts/askar'
 import { Agent } from '@credo-ts/core'
 import {
+  DidCommMessageHandlerRegistry,
   DidCommMessageSender,
   DidCommMimeType,
   DidCommModule,
@@ -9,7 +10,7 @@ import {
   DidCommOutOfBandState,
 } from '@credo-ts/didcomm'
 import { DidCommPushNotificationsFcmModule } from '@credo-ts/didcomm-push-notifications'
-import { agentDependencies, DidCommHttpInboundTransport, DidCommWsInboundTransport } from '@credo-ts/node'
+import { agentDependencies, DidCommWsInboundTransport } from '@credo-ts/node'
 import express, { type Express } from 'express'
 import Redis from 'ioredis'
 import type { WebSocket } from 'ws'
@@ -38,9 +39,11 @@ import {
 } from './instrumentation/metrics.js'
 import { StorageServiceMessageQueue } from './storage/StorageMessageQueue.js'
 import { registerWebSocketTelemetryContext } from './telemetry/api.js'
+import { AdmissionHttpInboundTransport } from './transports/AdmissionHttpInboundTransport.js'
 import { closeWebSocketClients } from './transports/closeWebSocketClients.js'
 import { InstrumentedHttpOutboundTransport } from './transports/InstrumentedHttpOutboundTransport.js'
 import { InstrumentedWsOutboundTransport } from './transports/InstrumentedWsOutboundTransport.js'
+import { createQueueAdmissionMiddleware } from './transports/queueAdmissionMiddleware.js'
 import { startWsHeartbeat } from './transports/wsHeartbeat.js'
 
 async function createModules({
@@ -61,7 +64,7 @@ async function createModules({
 
       transports: {
         inbound: [
-          new DidCommHttpInboundTransport({ app, port: config.agentPort }),
+          new AdmissionHttpInboundTransport({ app, port: config.agentPort }),
           new DidCommWsInboundTransport({ server: socketServer }),
         ],
         outbound: [new InstrumentedHttpOutboundTransport(), new InstrumentedWsOutboundTransport()],
@@ -168,6 +171,16 @@ export async function createAgent() {
     modules: modules as typeof modules & { askar: AskarModule },
   })
 
+  // A forward the queue cannot store is refused before it is acknowledged or handled. First in the list: the
+  // HTTP session waits for this middleware's answer (see AdmissionHttpInboundTransport).
+  agent.dependencyManager.resolve(DidCommMessageHandlerRegistry).messageHandlerMiddlewares.unshift(
+    createQueueAdmissionMiddleware({
+      queueTransportRepository,
+      messageForwardingStrategy: effectiveCredoMessageForwardingStrategy,
+      logger,
+    })
+  )
+
   // Added health check endpoint
   app.get('/health', async (_req, res) => {
     res.sendStatus(202)
@@ -211,7 +224,7 @@ export async function createAgent() {
   await agent.initialize()
 
   const inboundTransport = agent.didcomm.config.inboundTransports.find(
-    (transport) => transport instanceof DidCommHttpInboundTransport
+    (transport) => transport instanceof AdmissionHttpInboundTransport
   )
 
   inboundTransport?.server?.on('listening', () => {
