@@ -8,6 +8,7 @@ import {
   TakeFromQueueOptions,
 } from '@credo-ts/didcomm'
 import { DynamoDbClientRepository, DynamoDbClientRepositoryOptions } from './client.js'
+import { assertQueuedMessageFits } from './itemSize.js'
 
 export type DynamoDbTransportQueueOptions = DynamoDbClientRepositoryOptions & {
   /**
@@ -49,6 +50,25 @@ export class DidCommTransportQueueDynamoDb implements DidCommQueueTransportRepos
     options: TakeFromQueueOptions
   ): Promise<Array<QueuedDidCommMessage>> {
     return await this.client.getMessages(options)
+  }
+
+  /**
+   * Throws `QueuedMessageTooLargeError` when `addMessage` would refuse the message for its size. It reads
+   * nothing and writes nothing, so a caller can refuse an over-size message before it accepts it. Without a
+   * `connectionId` (not known before the message is handled) an allowance is counted for it.
+   */
+  public assertMessageFits(
+    options: Pick<AddMessageOptions, 'recipientDids' | 'payload'> & {
+      connectionId?: string
+      telemetry?: Record<string, string>
+    }
+  ): void {
+    assertQueuedMessageFits({
+      connectionId: options.connectionId,
+      recipientDids: options.recipientDids,
+      encryptedMessage: options.payload,
+      telemetry: options.telemetry,
+    })
   }
 
   public async addMessage(agentContext: AgentContext, options: AddMessageOptions): Promise<string> {
